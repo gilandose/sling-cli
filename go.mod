@@ -53,6 +53,7 @@ require (
 	github.com/jmoiron/sqlx v1.3.3
 	github.com/json-iterator/go v1.1.12
 	github.com/kardianos/osext v0.0.0-20190222173326-2bc1f35cddc0
+	github.com/kardianos/service v1.2.4
 	github.com/klauspost/compress v1.18.2
 	github.com/kshedden/datareader v0.0.0-20210325133423-816b6ffdd011
 	github.com/labstack/echo/v4 v4.10.2
