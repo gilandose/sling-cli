@@ -2221,3 +2221,21 @@
   run: 'sling run -p cmd/sling/tests/pipelines/p.29.agent_service_cli.yaml'
   output_contains:
     - 'Agent Service: all checks passed'
+
+- id: 232
+  name: 'SLING_TIMEOUT triggers on long-running pipeline query step'
+  run: 'sling run -p cmd/sling/tests/pipelines/p.30.sling_timeout.yaml'
+  env:
+    SLING_TIMEOUT: '0.1'
+  err: true
+  output_contains:
+    - 'SLING_TIMEOUT = 0.1 mins reached!'
+
+- id: 233
+  name: 'SLING_TIMEOUT triggers on long-running postgres-to-postgres replication'
+  run: 'sling run -r cmd/sling/tests/replications/r.102.sling_timeout.yaml'
+  env:
+    SLING_TIMEOUT: '0.1'
+  err: true
+  output_contains:
+    - 'SLING_TIMEOUT = 0.1 mins reached!'
