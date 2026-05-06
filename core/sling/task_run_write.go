@@ -248,7 +248,7 @@ func (t *TaskExecution) WriteToDb(cfg *Config, df *iop.Dataflow, tgtConn databas
 
 	// Pause dataflow to set up DDL and handlers
 	if paused := df.Pause(); !paused {
-		err = g.Error(err, "could not pause streams to infer columns")
+		err = g.Error("could not pause streams to infer columns")
 		return 0, err
 	}
 
@@ -504,7 +504,7 @@ func (t *TaskExecution) writeToDbDirectly(cfg *Config, df *iop.Dataflow, tgtConn
 
 	// Pause dataflow to set up DDL and handlers
 	if paused := df.Pause(); !paused {
-		err = g.Error(err, "could not pause streams to infer columns")
+		err = g.Error("could not pause streams to infer columns")
 		return 0, err
 	}
 
