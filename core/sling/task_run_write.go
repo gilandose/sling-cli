@@ -381,7 +381,7 @@ func (t *TaskExecution) WriteToDb(cfg *Config, df *iop.Dataflow, tgtConn databas
 				}
 				fallthrough // if not bulk loaded, then do error
 			default:
-				err = g.Error("inserted in temp table but table count (%d) != stream count (%d). Records missing/mismatch. Aborting", tCnt, cnt)
+				err = g.Error("post-load row count check returned a mismatch on the temp table %s: target count (%d) != stream count (%d). Aborting", tableTmp.FullName(), tCnt, cnt)
 				return 0, err
 			}
 		skipCountCompareError:
@@ -594,7 +594,7 @@ func (t *TaskExecution) writeToDbDirectly(cfg *Config, df *iop.Dataflow, tgtConn
 				}
 				fallthrough // if not bulk loaded, then do error
 			default:
-				err = g.Error("inserted in temp table but table count (%d) != stream count (%d). Records missing/mismatch. Aborting", tCnt, cnt)
+				err = g.Error("post-load row count check returned a mismatch on table %s: target count (%d) != stream count (%d). Aborting", targetTable.FullName(), tCnt, cnt)
 				return 0, err
 			}
 		skipCountCompareError:
