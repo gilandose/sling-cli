@@ -119,12 +119,22 @@ func (ac *APIConnection) ListEndpoints(patterns ...string) (endpoints Endpoints,
 		return nil, g.Error(err, "failed to render dynamic endpoints")
 	}
 
+	// Determine whether a specific pattern was requested. Without a pattern (or
+	// with a "*" pattern), broad enumeration callers (sling conns discover,
+	// replication wildcard expansion) should not surface queue_only endpoints
+	// because they produce no record stream. Explicit pattern lookups still
+	// return them so consumers can name them and dependency resolution finds them.
+	broadEnum := len(patterns) == 0 || patterns[0] == "" || patterns[0] == "*"
+
 	// Collect all endpoints (static + dynamically generated)
 	for _, endpointName := range ac.Spec.endpointsOrdered {
 		endpoint := ac.Spec.EndpointMap[endpointName]
-		if !endpoint.Disabled {
-			endpoints = append(endpoints, endpoint)
+		if endpoint.Disabled {
+			continue
+		} else if endpoint.QueueOnly && broadEnum {
+			continue
 		}
+		endpoints = append(endpoints, endpoint)
 	}
 
 	// fill DependsOn
@@ -304,12 +314,9 @@ func (ac *APIConnection) ReadDataflow(endpointName string, sCfg APIStreamConfig)
 			}
 		}
 
-		// Validate and register all found queues
+		// Register all found queues (existence is validated at LoadSpec time
+		// by checking that every consumer has at least one producer)
 		for queueName := range foundQueues {
-			if !g.In(queueName, ac.Spec.Queues...) {
-				return nil, g.Error("did not declare queue %s in queues list", queueName)
-			}
-
 			_, err = ac.RegisterQueue(queueName)
 			if err != nil {
 				return nil, g.Error(err, "could not register queue: %s", queueName)
@@ -321,6 +328,24 @@ func (ac *APIConnection) ReadDataflow(endpointName string, sCfg APIStreamConfig)
 	ds, err := streamRequests(endpoint, sCfg)
 	if err != nil {
 		return nil, g.Error(err, "could not stream requests")
+	}
+
+	// queue_only endpoints: drain the datastream synchronously so the request
+	// loop fires processors and populates queues, then return an empty closed
+	// dataflow so the caller (task_run_read.go) treats it as a no-record stream.
+	if endpoint.QueueOnly {
+		if _, err = ds.Collect(0); err != nil {
+			return nil, g.Error(err, "queue_only endpoint failed during drain")
+		}
+		if err = endpoint.teardown(); err != nil {
+			return nil, g.Error(err, "could not teardown queue_only endpoint")
+		}
+		df = iop.NewDataflowContext(ac.Context.Ctx)
+		df.Columns = iop.NewColumnsFromFields("_sling_queue_only")
+		df.Streams = append(df.Streams, ds) // for count
+		df.Ready = true
+		df.Close() // sets the closed flag and closes StreamCh
+		return df, nil
 	}
 
 	df, err = iop.MakeDataFlow(ds)

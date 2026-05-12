@@ -711,27 +711,6 @@ endpoints:
 			expected: []string{"producer_a", "producer_b"}, // all alphabetically
 		},
 		{
-			name: "endpoint depends on non-existent queue",
-			spec: `
-name: "Test API"
-queues:
-  - missing_queue
-
-endpoints:
-  consumer:
-    iterate:
-      over: "queue.missing_queue"
-      into: "state.id"
-    request:
-      url: "https://api.example.com/consumer"
-    response:
-      records:
-        jmespath: "data[]"
-`,
-			endpoint: "consumer",
-			expected: []string{}, // no producers found
-		},
-		{
 			name: "producer endpoint (no dependency)",
 			spec: `
 name: "Test API"
@@ -1990,9 +1969,9 @@ endpoints:
 		ep := s.EndpointMap["test_endpoint"]
 
 		// Order: +rules -> defaults -> rules+ -> hardcoded
-		assert.Equal(t, RuleTypeBreak, ep.Response.Rules[0].Action)          // prepend
-		assert.Equal(t, RuleTypeRetry, ep.Response.Rules[1].Action)          // default
-		assert.Equal(t, RuleTypeContinue, ep.Response.Rules[2].Action)       // append
+		assert.Equal(t, RuleTypeBreak, ep.Response.Rules[0].Action)                        // prepend
+		assert.Equal(t, RuleTypeRetry, ep.Response.Rules[1].Action)                        // default
+		assert.Equal(t, RuleTypeContinue, ep.Response.Rules[2].Action)                     // append
 		assert.Equal(t, RuleTypeRetry, ep.Response.Rules[len(ep.Response.Rules)-2].Action) // hardcoded retry
 		assert.Equal(t, RuleTypeFail, ep.Response.Rules[len(ep.Response.Rules)-1].Action)  // hardcoded fail
 	})
@@ -2465,4 +2444,114 @@ endpoints:
 		assert.Len(t, ep.Teardown, 1)
 		assert.Equal(t, "https://api.example.com/custom-teardown", ep.Teardown[0].Request.URL)
 	})
+}
+
+// TestSpecValidateQueueProducers_MissingProducer ensures that a spec consuming
+// a queue with no producer endpoint fails validation at LoadSpec time.
+func TestSpecValidateQueueProducers_MissingProducer(t *testing.T) {
+	spec := `
+name: "Test API"
+endpoints:
+  consumer:
+    iterate:
+      over: "queue.does_not_exist"
+      into: "state.id"
+    request:
+      url: "https://api.example.com/item"
+    response:
+      records:
+        jmespath: "[]"
+`
+	_, err := LoadSpec(spec)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "does_not_exist")
+	assert.Contains(t, err.Error(), "no endpoint produces")
+}
+
+// TestSpecQueueOnlyEndpointSorts ensures that an endpoint with queue_only: true
+// is sorted before its consumer based on the producer/consumer graph and that
+// no top-level `queues:` declaration is needed.
+func TestSpecQueueOnlyEndpointSorts(t *testing.T) {
+	spec := `
+name: "Test API"
+endpoints:
+  consumer:
+    iterate:
+      over: "queue.ids"
+      into: "state.id"
+    request:
+      url: "https://api.example.com/item/{state.id}"
+    response:
+      records:
+        jmespath: "[]"
+
+  producer:
+    queue_only: true
+    request:
+      url: "https://api.example.com/ids"
+    response:
+      records:
+        jmespath: "[]"
+      processors:
+        - expression: "record.id"
+          output: "queue.ids"
+`
+	s, err := LoadSpec(spec)
+	require.NoError(t, err)
+
+	// queue_only field round-trips through compilation
+	prod := s.EndpointMap["producer"]
+	assert.True(t, prod.QueueOnly, "producer endpoint should have queue_only=true")
+
+	// Build sortable endpoint list
+	eps := Endpoints{}
+	for _, name := range s.endpointsOrdered {
+		eps = append(eps, s.EndpointMap[name])
+	}
+	eps.Sort()
+
+	names := make([]string, len(eps))
+	for i, ep := range eps {
+		names[i] = ep.Name
+	}
+	assert.Equal(t, []string{"producer", "consumer"}, names, "producer should sort before consumer")
+
+	// HasUpstreams should find the producer as the consumer's upstream
+	upstreams := eps.HasUpstreams("consumer")
+	assert.Equal(t, []string{"producer"}, upstreams)
+}
+
+// TestSpecDeprecatedQueuesFieldStillLoads ensures that specs declaring the
+// legacy top-level `queues:` field still load cleanly (the field is now a
+// no-op accompanied by a deprecation warning, not an error).
+func TestSpecDeprecatedQueuesFieldStillLoads(t *testing.T) {
+	spec := `
+name: "Test API"
+queues:
+  - ids
+
+endpoints:
+  consumer:
+    iterate:
+      over: "queue.ids"
+      into: "state.id"
+    request:
+      url: "https://api.example.com/item/{state.id}"
+    response:
+      records:
+        jmespath: "[]"
+
+  producer:
+    request:
+      url: "https://api.example.com/ids"
+    response:
+      records:
+        jmespath: "[]"
+      processors:
+        - expression: "record.id"
+          output: "queue.ids"
+`
+	s, err := LoadSpec(spec)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"ids"}, s.Queues, "Queues field should still be populated for backwards compat")
 }

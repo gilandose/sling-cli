@@ -29,6 +29,7 @@ import (
 	"github.com/slingdata-io/sling-cli/core/dbio/iop"
 	"github.com/spf13/cast"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 )
 
@@ -3833,4 +3834,75 @@ endpoints:
 	assert.NoError(t, err, "paginated request should succeed after auth header refresh")
 	assert.Equal(t, 3, totalRequests, "should take 3 requests (page1 ok + page2 fail + page2 retry ok)")
 	t.Logf("collected records from both pages across %d HTTP requests", totalRequests)
+}
+
+// TestReadDataflow_QueueOnlyDrainsAndPopulatesQueue verifies that an endpoint
+// with queue_only: true runs its request loop (so processors fire and the
+// target queue is populated) but returns an empty Dataflow so callers treat
+// it as a no-record source.
+func TestReadDataflow_QueueOnlyDrainsAndPopulatesQueue(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]any{
+				{"id": 1},
+				{"id": 2},
+				{"id": 3},
+			},
+		})
+	}))
+	defer server.Close()
+
+	specYAML := fmt.Sprintf(`
+name: queue_only_api
+authentication:
+  type: none
+endpoints:
+  producer:
+    queue_only: true
+    request:
+      url: %s/ids
+      method: GET
+    response:
+      records:
+        jmespath: data
+      processors:
+        - expression: record.id
+          output: queue.ids
+`, server.URL)
+
+	spec, err := LoadSpec(specYAML)
+	require.NoError(t, err, "spec should load with queue_only endpoint and no top-level queues declaration")
+
+	ac, err := NewAPIConnection(context.Background(), spec, map[string]any{})
+	require.NoError(t, err)
+	defer ac.Close()
+
+	ac.State.Auth.Authenticated = true
+
+	df, err := ac.ReadDataflow("producer", APIStreamConfig{})
+	require.NoError(t, err)
+	require.NotNil(t, df)
+
+	// Empty dataflow: Collect returns zero rows with no error
+	data, err := df.Collect()
+	assert.NoError(t, err)
+	assert.Equal(t, 0, len(data.Rows), "queue_only endpoint should produce no record rows")
+
+	// The queue should exist and contain the 3 ids written by the processor
+	q, exists := ac.GetQueue("ids")
+	require.True(t, exists, "queue 'ids' should have been registered")
+	require.NotNil(t, q)
+
+	count := 0
+	for {
+		_, more, qErr := q.Next()
+		require.NoError(t, qErr)
+		if !more {
+			break
+		}
+		count++
+	}
+	assert.Equal(t, 3, count, "queue should contain the 3 ids emitted by the producer processor")
 }
