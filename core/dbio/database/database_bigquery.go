@@ -751,11 +751,14 @@ func (conn *BigQueryConn) importViaGoogleStorage(tableFName string, df *iop.Data
 		return
 	}
 
+	config := conn.importStreamConfig(table.Columns)
+
 	gcsPath := fmt.Sprintf(
-		"gs://%s/%s/%s.csv",
+		"gs://%s/%s/%s.%s",
 		gcBucket,
 		tempCloudStorageFolder,
 		tableFName,
+		config.Format,
 	)
 
 	err = filesys.Delete(fs, gcsPath)
@@ -771,7 +774,6 @@ func (conn *BigQueryConn) importViaGoogleStorage(tableFName string, df *iop.Data
 
 	g.Info("importing into bigquery via google storage")
 
-	config := conn.importStreamConfig(table.Columns)
 	fileReadyChn := make(chan filesys.FileReady, 10)
 
 	go func() {
