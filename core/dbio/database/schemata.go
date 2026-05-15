@@ -175,6 +175,30 @@ func (t *Table) NameQ() string {
 	return q + t.Name + q
 }
 
+func (t *Table) Clean() {
+	replace := func(old, new string) {
+		t.Database = strings.ReplaceAll(t.Database, old, new)
+		t.Schema = strings.ReplaceAll(t.Schema, old, new)
+		t.Name = strings.ReplaceAll(t.Name, old, new)
+	}
+
+	switch t.Dialect {
+	case dbio.TypeDbBigQuery:
+		// BigQuery is the strict outlier: even when backtick-quoted, table IDs
+		// must be alphanumeric + underscores (empirically verified). Strip the
+		// long tail of punctuation BQ rejects.
+		for _, c := range []string{
+			"$", ".", "/", "\\", "%", "+", "=", ":",
+			"\"", "[", "]", "<", ">", "@", "#",
+		} {
+			replace(c, "_")
+		}
+	case dbio.TypeDbOracle:
+		// Oracle quoted identifiers reject `"` (ORA-03001 unimplemented).
+		replace("\"", "_")
+	}
+}
+
 func (t *Table) FDQN() string {
 	q := GetQualifierQuote(t.Dialect)
 
