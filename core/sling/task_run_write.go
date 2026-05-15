@@ -311,6 +311,8 @@ func (t *TaskExecution) WriteToDb(cfg *Config, df *iop.Dataflow, tgtConn databas
 	t.AddCleanupTaskFirst(func() {
 		if cast.ToBool(os.Getenv("SLING_KEEP_TEMP")) {
 			return
+		} else if yes, _ := t.Context.Map.Get("temp_table_dropped"); cast.ToBool(yes) {
+			return
 		}
 
 		conn := tgtConn
@@ -320,6 +322,7 @@ func (t *TaskExecution) WriteToDb(cfg *Config, df *iop.Dataflow, tgtConn databas
 				conn.Connect()
 			}
 		}
+		t.Context.Map.Set("temp_table_dropped", true)
 		g.LogError(conn.DropTable(tableTmp.FullName()))
 		conn.Close()
 	})
