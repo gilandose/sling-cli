@@ -12,10 +12,15 @@
 
 - id: 3
   name: Run sling with Excel source
-  run: sling run --src-stream file://core/dbio/filesys/test/test.excel2.xlsx --tgt-object file://test.xlsx
-  rows: 1317
+  run: |
+    sling run --src-stream file://core/dbio/filesys/test/test.excel2.xlsx --tgt-object file://test.xlsx
+    sling run --src-stream file://core/dbio/filesys/test/test.excel.xlsm --stdout
   output_contains:
-    - wrote 1317 rows
+    - wrote 1317 rows to file://test.xlsx
+    - wrote 2 rows to stdout
+    - "id,name"
+    - "1,Alice"
+    - "2,Bob"
 
 - id: 4
   name: Run sling with CSV source and POSTGRES target

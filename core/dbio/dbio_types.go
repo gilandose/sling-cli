@@ -735,6 +735,17 @@ func (ft FileType) Ext() string {
 	}
 }
 
+// Exts returns all file extensions that should be detected as this FileType.
+// The first entry is always the canonical extension (same as Ext()).
+func (ft FileType) Exts() []string {
+	switch ft {
+	case FileTypeExcel:
+		return []string{".xlsx", ".xlsm", ".xls"}
+	default:
+		return []string{ft.Ext()}
+	}
+}
+
 func (ft FileType) IsJson() bool {
 	switch ft {
 	case FileTypeJson, FileTypeJsonLines, FileTypeGeojson:

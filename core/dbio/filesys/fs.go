@@ -1797,9 +1797,10 @@ func InferFileFormat(path string, defaults ...dbio.FileType) dbio.FileType {
 	path = strings.TrimSpace(strings.ToLower(path))
 
 	for _, fileType := range []dbio.FileType{dbio.FileTypeCsv, dbio.FileTypeJsonLines, dbio.FileTypeArrow, dbio.FileTypeJson, dbio.FileTypeGeojson, dbio.FileTypeXml, dbio.FileTypeParquet, dbio.FileTypeAvro, dbio.FileTypeSAS, dbio.FileTypeExcel} {
-		ext := fileType.Ext()
-		if strings.HasSuffix(path, ext) || strings.Contains(path, ext+".") {
-			return fileType
+		for _, ext := range fileType.Exts() {
+			if strings.HasSuffix(path, ext) || strings.Contains(path, ext+".") {
+				return fileType
+			}
 		}
 	}
 
