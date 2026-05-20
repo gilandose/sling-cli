@@ -891,8 +891,12 @@ func InferFromStats(columns []Column, safe bool, noDebug bool) []Column {
 	for j, col := range columns {
 		colStats := col.Stats
 
-		if colStats.TotalCnt == 0 || colStats.NullCnt == colStats.TotalCnt || col.Sourced {
-			// do nothing, keep existing type if defined
+		if colStats.TotalCnt == 0 || colStats.NullCnt == colStats.TotalCnt || col.Sourced || col.Type.IsBinary() {
+			// do nothing, keep existing type if defined.
+			// Binary columns are preserved even when their values arrive as
+			// []uint8 (which the stats tally as strings) so large binary
+			// payloads keep the binary native type instead of degrading to
+			// an unsized varchar that truncates at the string limit.
 		} else if colStats.StringCnt > 0 && colStats.BoolCnt == 0 && colStats.IntCnt == 0 && colStats.DecCnt == 0 && colStats.DateCnt == 0 && colStats.DateTimeCnt == 0 && colStats.DateTimeZCnt == 0 && colStats.JsonCnt == 0 {
 			// Only string values and no other types detected
 			col.Sourced = true // do not allow type change
@@ -1431,7 +1435,10 @@ remap:
 		maxStringType := template.Value("variable.max_string_type")
 
 		length := col.Stats.MaxLen
-		if col.IsString() {
+		// IsString() also reports true for binary; route binary columns to
+		// the dedicated binary branch below so they get an explicit
+		// binary(<size>) instead of falling through to varchar.
+		if col.IsString() && !col.IsBinary() {
 			isSourced := col.Sourced && col.DbPrecision > 0
 			if isSourced {
 				// string length was manually provided
@@ -1494,6 +1501,33 @@ remap:
 					"()",
 					fmt.Sprintf("(%d)", length),
 				)
+			}
+		} else if col.IsBinary() {
+			// Binary columns: fill the () with an explicit byte length so the
+			// target doesn't fall back to a small account-default size (which
+			// truncates large LOBs, e.g. Oracle BLOB/LONG RAW -> Snowflake).
+			// Use the sourced/known length when available, otherwise the
+			// connector's max binary length. Cap at that maximum.
+			maxBinaryLength := cast.ToInt(template.Value("variable.max_binary_length"))
+
+			length := col.Stats.MaxLen
+			if col.Sourced && col.DbPrecision > 0 {
+				length = col.DbPrecision
+			}
+			if length <= 0 || (maxBinaryLength > 0 && length > maxBinaryLength) {
+				// unknown or over the cap -> use the maximum the target allows
+				length = maxBinaryLength
+			}
+
+			if length > 0 {
+				nativeType = strings.ReplaceAll(
+					nativeType,
+					"()",
+					fmt.Sprintf("(%d)", length),
+				)
+			} else {
+				// no max configured for this connector; drop the ()
+				nativeType = strings.ReplaceAll(nativeType, "()", "")
 			}
 		} else if col.IsInteger() {
 			if !col.Sourced && length < env.DdlDefDecLength {

@@ -1429,6 +1429,7 @@ func WriteDataflowReadyViaDuckDB(fs FileSysClient, df *iop.Dataflow, uri string,
 			Format:        fileFormat,
 			Compression:   sc.Compression,
 			FileSizeBytes: sc.FileMaxBytes,
+			Columns:       streamPart.Columns,
 		}
 
 		// if * is specified, set default FileSizeBytes,

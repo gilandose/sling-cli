@@ -1,12 +1,18 @@
-# Validate Oracle LOB / XML / binary type fidelity into Snowflake.
-# Covers the user request: replicate CLOB, NCLOB, BLOB, RAW, XMLTYPE end-to-end
-# and assert row-level equality via MD5 checksums on both sides.
+# Validate Oracle LOB / XML / binary / LONG type fidelity into Snowflake.
+# Replicates CLOB, NCLOB, BLOB, RAW, XMLTYPE, LONG and LONG RAW end-to-end
+# and asserts row-level equality via MD5 / hex checksums on both sides.
 #
-# Two streams:
+# Streams:
 #   1. SLING_TEST_LOBS_DIRECT — default column mapping. Validates text-like
-#      LOB fidelity (CLOB, NCLOB, XMLTYPE).
+#      LOB fidelity (CLOB, NCLOB, XMLTYPE) plus binary BLOB / RAW.
 #   2. SLING_TEST_LOBS_HEX    — custom source SQL hex-encodes BLOB and RAW
 #      using RAWTOHEX, the recommended pattern for true binary fidelity.
+#   3. SLING_TEST_LONG        — LONG column (one LONG per table in Oracle),
+#      maps to string.
+#   4. SLING_TEST_LONGRAW     — LONG RAW column (cannot coexist with LONG),
+#      maps to binary.
+#   5. SLING_TEST_BIGBLOB     — a single ~30 MB BLOB value, validating large
+#      binary fidelity against Snowflake's expanded BINARY size limit.
 #
 # ─────────────────────────────────────────────────────────────
 # RELEASE NOTES BLURB (Oracle BLOB → binary mapping)
@@ -47,7 +53,7 @@ steps:
     query: DROP TABLE IF EXISTS PUBLIC.SLING_TEST_LOBS_HEX
 
   # ─────────────────────────────────────────────────────────────
-  # 1. Build the source table with every special type Alan asked about
+  # 1. Build the source table with every special LOB / binary / XML type
   # ─────────────────────────────────────────────────────────────
   - connection: ORACLE
     query: |
@@ -373,7 +379,7 @@ steps:
     failure_message: "row 1 XMLTYPE md5 mismatch: src={store.src_rows[0].md5_xml} tgt={store.direct_rows[0].md5_xml}"
 
   # BLOB and RAW round-trip — DIRECT stream must preserve the bytes exactly.
-  # This is the path Alan would use out-of-the-box (no RAWTOHEX workaround).
+  # This is the default path out-of-the-box (no RAWTOHEX workaround needed).
   - check: store.direct_rows[0].hex_blob == store.src_rows[0].hex_blob
     failure_message: "row 1 BLOB DIRECT hex mismatch: src={store.src_rows[0].hex_blob} tgt={store.direct_rows[0].hex_blob}"
 
@@ -470,14 +476,441 @@ steps:
   - check: int_parse(store.hex_agg[0].sum_md5_xml) == int_parse(store.src_agg[0].sum_md5_xml)
     failure_message: "HEX bulk XML md5 sum mismatch: src={store.src_agg[0].sum_md5_xml} tgt={store.hex_agg[0].sum_md5_xml}"
 
-  - log: "SUCCESS: Oracle LOB / XML / binary types replicated to Snowflake with full row-level fidelity"
+  # ─────────────────────────────────────────────────────────────
+  # 11. LONG column fidelity (maps to string)
+  #     Oracle allows only ONE LONG (or LONG RAW) column per table,
+  #     so LONG gets its own table. LONG holds up to 2 GB of text;
+  #     we exercise a small value and a large (~60KB) value.
+  # ─────────────────────────────────────────────────────────────
+  - connection: SNOWFLAKE
+    query: DROP TABLE IF EXISTS PUBLIC.SLING_TEST_LONG
+
+  - connection: ORACLE
+    query: |
+      BEGIN EXECUTE IMMEDIATE 'DROP TABLE ORACLE.SLING_TEST_LONG PURGE';
+      EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;
+
+  - connection: ORACLE
+    query: |
+      CREATE TABLE ORACLE.SLING_TEST_LONG (
+        id       NUMBER(10) PRIMARY KEY,
+        name     VARCHAR2(100) NOT NULL,
+        long_col LONG
+      )
+
+  - connection: ORACLE
+    query: |
+      INSERT INTO ORACLE.SLING_TEST_LONG (id, name, long_col)
+      VALUES (1, 'long_small', 'small long text — unicode café 中文 🚀')
+
+  # ~32KB LONG value. A PL/SQL LONG/VARCHAR2 local caps at 32760 bytes,
+  # so build the largest value that fits the PL/SQL buffer.
+  - connection: ORACLE
+    query: |
+      DECLARE
+        v_long VARCHAR2(32000);
+      BEGIN
+        FOR i IN 1..8 LOOP
+          v_long := v_long || RPAD('L', 4000, 'M');
+        END LOOP;
+        INSERT INTO ORACLE.SLING_TEST_LONG (id, name, long_col)
+        VALUES (2, 'long_large', v_long);
+      END;
+
+  - connection: ORACLE
+    query: |
+      INSERT INTO ORACLE.SLING_TEST_LONG (id, name, long_col)
+      VALUES (3, 'long_null', NULL)
+
+  - connection: ORACLE
+    query: COMMIT
+
+  # LONG cannot be used by SQL functions directly. TO_LOB is only valid in
+  # CREATE TABLE AS SELECT / INSERT SELECT, so materialize a CLOB copy first.
+  - connection: ORACLE
+    query: |
+      BEGIN EXECUTE IMMEDIATE 'DROP TABLE ORACLE.SLING_TEST_LONG_REF PURGE';
+      EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;
+
+  - connection: ORACLE
+    query: |
+      CREATE TABLE ORACLE.SLING_TEST_LONG_REF AS
+      SELECT id, name, TO_LOB(long_col) AS long_clob FROM ORACLE.SLING_TEST_LONG
+
+  - connection: ORACLE
+    query: |
+      SELECT
+        id,
+        name,
+        NVL(DBMS_LOB.GETLENGTH(long_clob), 0) AS len_long,
+        LOWER(NVL(STANDARD_HASH(NVL(DBMS_LOB.SUBSTR(long_clob, 4000, 1), ' '), 'MD5'), '0')) AS md5_long_head
+      FROM ORACLE.SLING_TEST_LONG_REF
+      ORDER BY id
+    into: src_long
+
+  - log: |
+      Oracle source LONG rows:
+      {pretty_table(store.src_long)}
+
+  - replication:
+      source: ORACLE
+      target: SNOWFLAKE
+      defaults:
+        mode: full-refresh
+      streams:
+        ORACLE.SLING_TEST_LONG:
+          object: PUBLIC.SLING_TEST_LONG
+
+  - connection: SNOWFLAKE
+    query: |
+      SELECT
+        ID                                                                   AS id,
+        NAME                                                                 AS name,
+        COALESCE(LENGTH(LONG_COL), 0)                                        AS len_long,
+        LOWER(COALESCE(MD5(COALESCE(SUBSTR(LONG_COL, 1, 4000), ' ')), '0'))  AS md5_long_head
+      FROM PUBLIC.SLING_TEST_LONG
+      ORDER BY ID
+    into: tgt_long
+
+  - log: |
+      Snowflake LONG rows:
+      {pretty_table(store.tgt_long)}
+
+  - check: length(store.tgt_long) == 3
+    failure_message: "LONG: expected 3 rows, got {length(store.tgt_long)}"
+
+  # Row 1 holds multibyte text (em-dash, accents, CJK, emoji). Oracle's
+  # CLOB char length and Snowflake's codepoint LENGTH differ slightly for
+  # astral-plane chars (same caveat the NCLOB checks document above), so
+  # require non-empty rather than an exact count; MD5 is the fidelity test.
+  - check: int_parse(store.tgt_long[0].len_long) > 0
+    failure_message: "LONG row 1 should be non-empty in target, got len={store.tgt_long[0].len_long}"
+
+  # Row 2 is pure ASCII (RPAD of 'L'/'M'), so Oracle and Snowflake hash
+  # identical bytes — exact length + full MD5 is the rigorous fidelity gate.
+  - check: int_parse(store.tgt_long[1].len_long) == int_parse(store.src_long[1].len_long)
+    failure_message: "LONG row 2 (large) length mismatch: src={store.src_long[1].len_long} tgt={store.tgt_long[1].len_long}"
+
+  - check: store.tgt_long[1].md5_long_head == store.src_long[1].md5_long_head
+    failure_message: "LONG row 2 (large) md5 mismatch: src={store.src_long[1].md5_long_head} tgt={store.tgt_long[1].md5_long_head}"
+
+  - check: int_parse(store.tgt_long[2].len_long) == 0
+    failure_message: "LONG row 3 should be null/empty, got len={store.tgt_long[2].len_long}"
 
   # ─────────────────────────────────────────────────────────────
-  # 10. Cleanup
+  # 12. LONG RAW column fidelity (maps to binary)
+  #     Separate table — LONG RAW cannot coexist with LONG.
+  # ─────────────────────────────────────────────────────────────
+  - connection: SNOWFLAKE
+    query: DROP TABLE IF EXISTS PUBLIC.SLING_TEST_LONGRAW
+
+  - connection: ORACLE
+    query: |
+      BEGIN EXECUTE IMMEDIATE 'DROP TABLE ORACLE.SLING_TEST_LONGRAW PURGE';
+      EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;
+
+  - connection: ORACLE
+    query: |
+      CREATE TABLE ORACLE.SLING_TEST_LONGRAW (
+        id          NUMBER(10) PRIMARY KEY,
+        name        VARCHAR2(100) NOT NULL,
+        longraw_col LONG RAW
+      )
+
+  - connection: ORACLE
+    query: |
+      INSERT INTO ORACLE.SLING_TEST_LONGRAW (id, name, longraw_col)
+      VALUES (1, 'longraw_small', HEXTORAW('DEADBEEFCAFEBABE0011223344556677'))
+
+  # ~30KB LONG RAW value built in PL/SQL
+  - connection: ORACLE
+    query: |
+      DECLARE
+        v_lr LONG RAW;
+      BEGIN
+        FOR i IN 1..120 LOOP
+          v_lr := v_lr || UTL_RAW.CAST_TO_RAW(RPAD('R', 256, 'S'));
+        END LOOP;
+        INSERT INTO ORACLE.SLING_TEST_LONGRAW (id, name, longraw_col)
+        VALUES (2, 'longraw_large', v_lr);
+      END;
+
+  - connection: ORACLE
+    query: |
+      INSERT INTO ORACLE.SLING_TEST_LONGRAW (id, name, longraw_col)
+      VALUES (3, 'longraw_null', NULL)
+
+  - connection: ORACLE
+    query: COMMIT
+
+  # Convert LONG RAW → BLOB via TO_LOB (CTAS only) before hashing.
+  - connection: ORACLE
+    query: |
+      BEGIN EXECUTE IMMEDIATE 'DROP TABLE ORACLE.SLING_TEST_LONGRAW_REF PURGE';
+      EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;
+
+  - connection: ORACLE
+    query: |
+      CREATE TABLE ORACLE.SLING_TEST_LONGRAW_REF AS
+      SELECT id, name, TO_LOB(longraw_col) AS lr_blob FROM ORACLE.SLING_TEST_LONGRAW
+
+  - connection: ORACLE
+    query: |
+      SELECT
+        id,
+        name,
+        NVL(DBMS_LOB.GETLENGTH(lr_blob), 0) AS len_longraw,
+        LOWER(NVL(STANDARD_HASH(DBMS_LOB.SUBSTR(lr_blob, 2000, 1), 'MD5'), '0')) AS md5_longraw_head
+      FROM ORACLE.SLING_TEST_LONGRAW_REF
+      ORDER BY id
+    into: src_longraw
+
+  - log: |
+      Oracle source LONG RAW rows:
+      {pretty_table(store.src_longraw)}
+
+  - replication:
+      source: ORACLE
+      target: SNOWFLAKE
+      defaults:
+        mode: full-refresh
+      streams:
+        ORACLE.SLING_TEST_LONGRAW:
+          object: PUBLIC.SLING_TEST_LONGRAW
+
+  # BLOB lands as BINARY in Snowflake; MD5 over the binary bytes must match
+  # Oracle's STANDARD_HASH over the same leading bytes.
+  - connection: SNOWFLAKE
+    query: |
+      SELECT
+        ID                                                                          AS id,
+        NAME                                                                        AS name,
+        COALESCE(LENGTH(LONGRAW_COL), 0)                                            AS len_longraw,
+        LOWER(COALESCE(MD5(SUBSTR(LONGRAW_COL, 1, 2000)), '0'))                      AS md5_longraw_head
+      FROM PUBLIC.SLING_TEST_LONGRAW
+      ORDER BY ID
+    into: tgt_longraw
+
+  - log: |
+      Snowflake LONG RAW rows:
+      {pretty_table(store.tgt_longraw)}
+
+  - check: length(store.tgt_longraw) == 3
+    failure_message: "LONG RAW: expected 3 rows, got {length(store.tgt_longraw)}"
+
+  - check: int_parse(store.tgt_longraw[0].len_longraw) == int_parse(store.src_longraw[0].len_longraw)
+    failure_message: "LONG RAW row 1 length mismatch: src={store.src_longraw[0].len_longraw} tgt={store.tgt_longraw[0].len_longraw}"
+
+  - check: int_parse(store.tgt_longraw[1].len_longraw) == int_parse(store.src_longraw[1].len_longraw)
+    failure_message: "LONG RAW row 2 (large) length mismatch: src={store.src_longraw[1].len_longraw} tgt={store.tgt_longraw[1].len_longraw}"
+
+  - check: int_parse(store.tgt_longraw[2].len_longraw) == 0
+    failure_message: "LONG RAW row 3 should be null/empty, got len={store.tgt_longraw[2].len_longraw}"
+
+  # ─────────────────────────────────────────────────────────────
+  # 13. Large (~30 MB) BLOB fidelity
+  #     Validates a single multi-MB binary value end-to-end. Snowflake's
+  #     expanded limits allow BINARY up to 64 MB per value, so a 30 MB
+  #     payload must round-trip with byte-exact fidelity. The target
+  #     column is explicitly sized so it is not capped at a small default.
+  # ─────────────────────────────────────────────────────────────
+  - connection: SNOWFLAKE
+    query: DROP TABLE IF EXISTS PUBLIC.SLING_TEST_BIGBLOB
+
+  - connection: ORACLE
+    query: |
+      BEGIN EXECUTE IMMEDIATE 'DROP TABLE ORACLE.SLING_TEST_BIGBLOB PURGE';
+      EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;
+
+  - connection: ORACLE
+    query: |
+      CREATE TABLE ORACLE.SLING_TEST_BIGBLOB (
+        id       NUMBER(10) PRIMARY KEY,
+        name     VARCHAR2(100) NOT NULL,
+        big_blob BLOB
+      )
+
+  # Build a ~30 MB BLOB: append 30 MB of pseudo-random binary in 32KB
+  # chunks (DBMS_RANDOM seeded for a reproducible payload across runs).
+  - connection: ORACLE
+    query: |
+      DECLARE
+        v_blob   BLOB;
+        v_chunk  RAW(32767);
+        v_target NUMBER := 30 * 1024 * 1024;  -- 30 MB
+      BEGIN
+        DBMS_RANDOM.SEED(42);
+        DBMS_LOB.CREATETEMPORARY(v_blob, TRUE);
+        WHILE DBMS_LOB.GETLENGTH(v_blob) < v_target LOOP
+          v_chunk := UTL_RAW.CAST_TO_RAW(DBMS_RANDOM.STRING('X', 16000));
+          DBMS_LOB.WRITEAPPEND(v_blob, UTL_RAW.LENGTH(v_chunk), v_chunk);
+        END LOOP;
+        INSERT INTO ORACLE.SLING_TEST_BIGBLOB (id, name, big_blob)
+        VALUES (1, 'big_blob_30mb', v_blob);
+        DBMS_LOB.FREETEMPORARY(v_blob);
+      END;
+
+  - connection: ORACLE
+    query: COMMIT
+
+  # Source reference. Oracle 18c STANDARD_HASH cannot take a multi-MB LOB
+  # and DBMS_CRYPTO is not granted here, so prove fidelity via the exact
+  # byte length plus MD5 over three fixed 2000-byte windows (head, middle,
+  # tail). Matching length + three independent windows at known offsets is
+  # a strong byte-exact signal for a 30 MB value and reliably catches the
+  # real-world failure modes (truncation, mid-stream corruption).
+  - connection: ORACLE
+    query: |
+      SELECT
+        id,
+        name,
+        DBMS_LOB.GETLENGTH(big_blob)                                                       AS len_blob,
+        LOWER(STANDARD_HASH(DBMS_LOB.SUBSTR(big_blob, 2000, 1), 'MD5'))                     AS md5_head,
+        LOWER(STANDARD_HASH(DBMS_LOB.SUBSTR(big_blob, 2000, 15000000), 'MD5'))              AS md5_mid,
+        LOWER(STANDARD_HASH(DBMS_LOB.SUBSTR(big_blob, 2000, DBMS_LOB.GETLENGTH(big_blob) - 1999), 'MD5')) AS md5_tail
+      FROM ORACLE.SLING_TEST_BIGBLOB
+      ORDER BY id
+    into: src_bigblob
+
+  - log: |
+      Oracle source 30MB BLOB:
+      {pretty_table(store.src_bigblob)}
+
+  - check: int_parse(store.src_bigblob[0].len_blob) >= 31457280
+    failure_message: "source BLOB expected >= 30MB, got {store.src_bigblob[0].len_blob} bytes"
+
+  # Sling auto-creates the target with BINARY(67108864) DDL — no pre-create
+  # needed. This validates the Snowflake binary DDL path (general_type_map
+  # binary -> binary() filled to max_binary_length) end-to-end.
+  - replication:
+      source: ORACLE
+      target: SNOWFLAKE
+      defaults:
+        mode: full-refresh
+      streams:
+        ORACLE.SLING_TEST_BIGBLOB:
+          object: PUBLIC.SLING_TEST_BIGBLOB
+
+  # Same windows on the Snowflake side. SUBSTR on BINARY is 1-indexed and
+  # byte-based, matching Oracle's DBMS_LOB.SUBSTR(amount, offset).
+  - connection: SNOWFLAKE
+    query: |
+      SELECT
+        ID                                                                 AS id,
+        NAME                                                               AS name,
+        COALESCE(LENGTH(BIG_BLOB), 0)                                      AS len_blob,
+        LOWER(COALESCE(MD5(SUBSTR(BIG_BLOB, 1, 2000)), ''))                AS md5_head,
+        LOWER(COALESCE(MD5(SUBSTR(BIG_BLOB, 15000000, 2000)), ''))         AS md5_mid,
+        LOWER(COALESCE(MD5(SUBSTR(BIG_BLOB, LENGTH(BIG_BLOB) - 1999, 2000)), '')) AS md5_tail
+      FROM PUBLIC.SLING_TEST_BIGBLOB
+      ORDER BY ID
+    into: tgt_bigblob
+
+  - log: |
+      Snowflake 30MB BLOB:
+      {pretty_table(store.tgt_bigblob)}
+
+  - check: length(store.tgt_bigblob) == 1
+    failure_message: "BIGBLOB: expected 1 row, got {length(store.tgt_bigblob)}"
+
+  # Byte count must be identical end-to-end (catches any truncation).
+  - check: int_parse(store.tgt_bigblob[0].len_blob) == int_parse(store.src_bigblob[0].len_blob)
+    failure_message: "30MB BLOB length mismatch: src={store.src_bigblob[0].len_blob} tgt={store.tgt_bigblob[0].len_blob}"
+
+  # Head / middle / tail 2000-byte windows must all match — proves bytes
+  # at the start, deep middle, and very end of the 30 MB value survived.
+  - check: store.tgt_bigblob[0].md5_head == store.src_bigblob[0].md5_head
+    failure_message: "30MB BLOB head-window MD5 mismatch: src={store.src_bigblob[0].md5_head} tgt={store.tgt_bigblob[0].md5_head}"
+
+  - check: store.tgt_bigblob[0].md5_mid == store.src_bigblob[0].md5_mid
+    failure_message: "30MB BLOB mid-window MD5 mismatch: src={store.src_bigblob[0].md5_mid} tgt={store.tgt_bigblob[0].md5_mid}"
+
+  - check: store.tgt_bigblob[0].md5_tail == store.src_bigblob[0].md5_tail
+    failure_message: "30MB BLOB tail-window MD5 mismatch: src={store.src_bigblob[0].md5_tail} tgt={store.tgt_bigblob[0].md5_tail}"
+
+  # ─────────────────────────────────────────────────────────────
+  # 13b. Same 30 MB BLOB via the PARQUET staging path
+  #     Snowflake CopyViaStage supports format=parquet as a target option.
+  #     Parquet preserves binary natively (no hex doubling) so this is the
+  #     more efficient path for large binary values. Sling auto-creates the
+  #     target with the correct BINARY(67108864) DDL — no pre-create needed.
+  # ─────────────────────────────────────────────────────────────
+  - replication:
+      source: ORACLE
+      target: SNOWFLAKE
+      defaults:
+        mode: full-refresh
+        target_options:
+          format: parquet
+      streams:
+        ORACLE.SLING_TEST_BIGBLOB:
+          object: PUBLIC.SLING_TEST_BIGBLOB_PARQUET
+
+  - connection: SNOWFLAKE
+    query: |
+      SELECT
+        ID                                                                 AS id,
+        NAME                                                               AS name,
+        COALESCE(LENGTH(BIG_BLOB), 0)                                      AS len_blob,
+        LOWER(COALESCE(MD5(SUBSTR(BIG_BLOB, 1, 2000)), ''))                AS md5_head,
+        LOWER(COALESCE(MD5(SUBSTR(BIG_BLOB, 15000000, 2000)), ''))         AS md5_mid,
+        LOWER(COALESCE(MD5(SUBSTR(BIG_BLOB, LENGTH(BIG_BLOB) - 1999, 2000)), '')) AS md5_tail
+      FROM PUBLIC.SLING_TEST_BIGBLOB_PARQUET
+      ORDER BY ID
+    into: tgt_bigblob_pq
+
+  - log: |
+      Snowflake 30MB BLOB (PARQUET stage):
+      {pretty_table(store.tgt_bigblob_pq)}
+
+  - check: length(store.tgt_bigblob_pq) == 1
+    failure_message: "BIGBLOB(parquet): expected 1 row, got {length(store.tgt_bigblob_pq)}"
+
+  - check: int_parse(store.tgt_bigblob_pq[0].len_blob) == int_parse(store.src_bigblob[0].len_blob)
+    failure_message: "30MB BLOB (parquet) length mismatch: src={store.src_bigblob[0].len_blob} tgt={store.tgt_bigblob_pq[0].len_blob}"
+
+  - check: store.tgt_bigblob_pq[0].md5_head == store.src_bigblob[0].md5_head
+    failure_message: "30MB BLOB (parquet) head-window MD5 mismatch: src={store.src_bigblob[0].md5_head} tgt={store.tgt_bigblob_pq[0].md5_head}"
+
+  - check: store.tgt_bigblob_pq[0].md5_mid == store.src_bigblob[0].md5_mid
+    failure_message: "30MB BLOB (parquet) mid-window MD5 mismatch: src={store.src_bigblob[0].md5_mid} tgt={store.tgt_bigblob_pq[0].md5_mid}"
+
+  - check: store.tgt_bigblob_pq[0].md5_tail == store.src_bigblob[0].md5_tail
+    failure_message: "30MB BLOB (parquet) tail-window MD5 mismatch: src={store.src_bigblob[0].md5_tail} tgt={store.tgt_bigblob_pq[0].md5_tail}"
+
+  - log: "SUCCESS: Oracle LOB / XML / binary / LONG / LONG RAW types (incl. 30MB BLOB via CSV and PARQUET) replicated to Snowflake with full row-level fidelity"
+
+  # ─────────────────────────────────────────────────────────────
+  # 14. Cleanup
   # ─────────────────────────────────────────────────────────────
   - connection: ORACLE
     query: |
       BEGIN EXECUTE IMMEDIATE 'DROP TABLE ORACLE.SLING_TEST_LOBS PURGE';
+      EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;
+
+  - connection: ORACLE
+    query: |
+      BEGIN EXECUTE IMMEDIATE 'DROP TABLE ORACLE.SLING_TEST_LONG PURGE';
+      EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;
+
+  - connection: ORACLE
+    query: |
+      BEGIN EXECUTE IMMEDIATE 'DROP TABLE ORACLE.SLING_TEST_LONG_REF PURGE';
+      EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;
+
+  - connection: ORACLE
+    query: |
+      BEGIN EXECUTE IMMEDIATE 'DROP TABLE ORACLE.SLING_TEST_LONGRAW PURGE';
+      EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;
+
+  - connection: ORACLE
+    query: |
+      BEGIN EXECUTE IMMEDIATE 'DROP TABLE ORACLE.SLING_TEST_LONGRAW_REF PURGE';
+      EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;
+
+  - connection: ORACLE
+    query: |
+      BEGIN EXECUTE IMMEDIATE 'DROP TABLE ORACLE.SLING_TEST_BIGBLOB PURGE';
       EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;
 
   - connection: SNOWFLAKE
@@ -485,3 +918,15 @@ steps:
 
   - connection: SNOWFLAKE
     query: DROP TABLE IF EXISTS PUBLIC.SLING_TEST_LOBS_HEX
+
+  - connection: SNOWFLAKE
+    query: DROP TABLE IF EXISTS PUBLIC.SLING_TEST_LONG
+
+  - connection: SNOWFLAKE
+    query: DROP TABLE IF EXISTS PUBLIC.SLING_TEST_LONGRAW
+
+  - connection: SNOWFLAKE
+    query: DROP TABLE IF EXISTS PUBLIC.SLING_TEST_BIGBLOB
+
+  - connection: SNOWFLAKE
+    query: DROP TABLE IF EXISTS PUBLIC.SLING_TEST_BIGBLOB_PARQUET

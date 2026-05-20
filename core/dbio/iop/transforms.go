@@ -6,6 +6,7 @@ import (
 	"crypto/sha512"
 	"embed"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"regexp"
 	"strings"
@@ -605,13 +606,7 @@ func (t transformsNS) BinaryToHex(val string) string {
 		return ""
 	}
 
-	// Convert each byte to hex and concatenate
-	hexStr := ""
-	for _, b := range []byte(val) {
-		hexStr += fmt.Sprintf("%02X", b)
-	}
-
-	return hexStr
+	return strings.ToUpper(hex.EncodeToString([]byte(val)))
 }
 
 func (t transformsNS) Replace0x00(sp *StreamProcessor, val string) (string, error) {

@@ -13,9 +13,9 @@ core:
   select_stream_scanner: select {fields} from {stream_scanner} {where}
   export_to_local: |
     COPY (
-      select *
+      select {select_expr}
       from {table}
-    ) TO '{local_path}' 
+    ) TO '{local_path}'
     (
       format '{format}', overwrite true, {file_size_bytes_expr} {file_extension_expr}
       compression '{compression}'
@@ -23,7 +23,7 @@ core:
   export_to_local_partitions: |
     COPY (
       select
-        *,
+        {select_expr},
         {partition_expressions}
       from {table}
     ) TO '{local_path}'
