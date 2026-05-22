@@ -8,7 +8,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SLING_CLI_DIR="$(cd "$SCRIPT_DIR/../../../../.." && pwd)"
+SLING_CLI_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 CMD_DIR="$SLING_CLI_DIR/cmd/sling"
 SLING_BIN="$CMD_DIR/sling"
 

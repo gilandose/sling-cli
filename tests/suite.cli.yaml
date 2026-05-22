@@ -2270,12 +2270,12 @@
   name: 'sling api queue'
   run: |
     cd tests/specs/queue_only_omdb
-    sling run -d pipeline.yaml 
+    sling run -d pipeline.yaml
   output_contains:
-    - records pushed to queue
+    - items pushed to queue
 
 - id: 237
-  name: 'Oracle LOB / XML / binary types replicate to Snowflake with row-level fidelity'
+  name: 'Oracle LOB / XML / binary / LONG / LONG RAW types (incl. 30MB BLOB via CSV and PARQUET) replicate to Snowflake with row-level fidelity'
   run: 'sling run -d -p tests/pipelines/p.31.oracle_special_types.yaml'
   output_contains:
-    - 'SUCCESS: Oracle LOB / XML / binary types replicated to Snowflake with full row-level fidelity'
+    - 'SUCCESS: Oracle LOB / XML / binary / LONG / LONG RAW types (incl. 30MB BLOB via CSV and PARQUET) replicated to Snowflake with full row-level fidelity'
