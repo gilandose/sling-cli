@@ -1,11 +1,13 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
 	"github.com/flarco/g"
 	"github.com/samber/lo"
+	"github.com/spf13/cast"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v2"
@@ -2789,4 +2791,84 @@ endpoints:
 	authSeq := parseSequenceFromInterface(s.Authentication["sequence"])
 	require.Len(t, authSeq, 1)
 	assert.Equal(t, 3, len(authSeq[0].Response.Rules), "spec auth sequence should have exactly 3 default rules across multiple compiles, got %d", len(authSeq[0].Response.Rules))
+}
+
+// TestDynamicEndpointInnerIterateSurvivesRender reproduces the report that a
+// dynamic endpoint with an inner `iterate.over: chunk(...)` loop loses that
+// expression: `state.batch_ids` is never populated and `{state.batch_ids}` is
+// passed through literally in the request payload.
+//
+// renderEndpointTemplate deep-copies the endpoint template via a JSON round-trip
+// (g.Marshal -> g.Unmarshal) and builds an `originalMap` from that same JSON.
+// CompileSpecEndpoint then uses `originalMap` to decide which fields were
+// explicitly set: a field absent from originalMap is overwritten by the spec
+// default. The root cause was a wrong JSON tag on the Iterate.Over field
+// (`json:"iterate"` instead of `json:"over"`): the JSON had key `iterate`
+// instead of `over` inside the `iterate` object, so the `iterate.over` presence
+// check failed and CompileSpecEndpoint wiped Over with the (empty) default.
+// This test asserts the inner iterate.over expression survives both render and
+// compile of a dynamic endpoint.
+func TestDynamicEndpointInnerIterateSurvivesRender(t *testing.T) {
+	spec := `
+name: "Dynamic Inner Iterate API"
+defaults:
+  state:
+    base_url: "https://api.example.com"
+
+dynamic_endpoints:
+  - iterate:
+      - model: res.partner
+    into: 'state.endpoint'
+    endpoint:
+      name: '{snake(state.endpoint.model)}'
+      iterate:
+        over: 'chunk(state.item_ids, 7)'
+        into: 'state.batch_ids'
+        concurrency: 1
+      request:
+        method: POST
+        url: "{state.base_url}/{state.endpoint.model}"
+        payload:
+          ids: '{state.batch_ids}'
+      response:
+        records:
+          jmespath: "result[*]"
+`
+
+	s, err := LoadSpec(spec)
+	require.NoError(t, err)
+	require.True(t, s.IsDynamic())
+	require.Equal(t, 1, len(s.DynamicEndpoints))
+
+	dynEndpoint := s.DynamicEndpoints[0]
+
+	// Sanity-check the inner iterate.over survives loading the spec itself.
+	require.NotNil(t, dynEndpoint.Endpoint.Iterate.Over)
+	assert.Equal(t, "chunk(state.item_ids, 7)", cast.ToString(dynEndpoint.Endpoint.Iterate.Over),
+		"inner iterate.over should be preserved when loading the spec")
+
+	// renderEndpointTemplate is what RenderDynamicEndpoints calls per iteration;
+	// it deep-copies the endpoint template via a JSON round-trip.
+	ac, err := NewAPIConnection(context.Background(), s, map[string]any{})
+	require.NoError(t, err)
+
+	rendered, err := ac.renderEndpointTemplate(dynEndpoint, map[string]any{"model": "res.partner"}, nil)
+	require.NoError(t, err)
+
+	require.NotNil(t, rendered.Iterate.Over,
+		"inner iterate.over must not be lost in renderEndpointTemplate's JSON round-trip")
+	assert.Equal(t, "chunk(state.item_ids, 7)", cast.ToString(rendered.Iterate.Over),
+		"rendered dynamic endpoint must keep the inner chunk() iterate expression")
+
+	// CompileSpecEndpoint runs next in the real pipeline; it uses originalMap
+	// (built from the same JSON) to detect explicitly-set fields. With the wrong
+	// JSON tag this is where Over got reset to the empty default.
+	require.NoError(t, CompileSpecEndpoint(rendered, s))
+
+	require.NotNil(t, rendered.Iterate.Over,
+		"inner iterate.over must survive CompileSpecEndpoint (not be overwritten by default)")
+	assert.Equal(t, "chunk(state.item_ids, 7)", cast.ToString(rendered.Iterate.Over),
+		"compiled dynamic endpoint must keep the inner chunk() iterate expression")
+	assert.Equal(t, "state.batch_ids", rendered.Iterate.Into,
+		"compiled dynamic endpoint must keep the inner iterate.into target")
 }

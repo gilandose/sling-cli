@@ -753,6 +753,24 @@ func TestHTTPCallAndResponseExtraction(t *testing.T) {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
 
+				// Body-aware mock for chunk/iterate tests: echo back one record
+				// per id found in the request payload's "ids" array. This proves
+				// each distinct chunk produces distinct records (so a regression
+				// where only the first chunk loads would fail this test).
+				if strings.Contains(tc.Name, "chunk_iterate") {
+					body, _ := io.ReadAll(r.Body)
+					var reqBody struct {
+						Ids []any `json:"ids"`
+					}
+					_ = g.JSONUnmarshal(body, &reqBody)
+					data := []map[string]any{}
+					for _, id := range reqBody.Ids {
+						data = append(data, map[string]any{"id": id, "name": g.F("item_%v", id)})
+					}
+					json.NewEncoder(w).Encode(map[string]any{"data": data})
+					return
+				}
+
 				// Handle different endpoints based on path
 				switch r.URL.Path {
 				case "/login":
@@ -804,9 +822,12 @@ func TestHTTPCallAndResponseExtraction(t *testing.T) {
 			for k, v := range tc.Spec.EndpointMap["test_endpoint"].State {
 				endpoint.State[k] = v
 			}
-			endpoint.Request = Request{
-				URL:    server.URL + "/test",
-				Method: MethodGet,
+			// Point the request at the mock server, but preserve a
+			// spec-defined Method/Payload (needed for POST-based tests
+			// such as chunk/iterate). Default to GET when unset.
+			endpoint.Request.URL = server.URL + "/test"
+			if endpoint.Request.Method == "" {
+				endpoint.Request.Method = MethodGet
 			}
 
 			// Update authentication sequence URLs if present
