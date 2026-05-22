@@ -80,15 +80,11 @@ func TestCLI(t *testing.T) {
 
 	defaultEnv := g.KVArrToMap(os.Environ()...)
 
-	// Prepend the directory holding the freshly-built sling binary to PATH so
-	// any child process (e.g. bash spawned by pipeline `command` steps that
-	// run `sling ...`) resolves `sling` to the test binary rather than a
-	// system-installed one. The test wrapper itself aliases `sling` to the
-	// absolute path, but aliases don't propagate to child shells. The `bin`
-	// path is relative to the wrapper's WorkDir (repo root = ../..).
+	// Resolve the freshly-built sling binary to an absolute path.
+	absBin := bin
 	if wd, err := os.Getwd(); err == nil {
 		repoRoot := filepath.Clean(filepath.Join(wd, "..", ".."))
-		absBin := filepath.Clean(filepath.Join(repoRoot, bin))
+		absBin = filepath.Clean(filepath.Join(repoRoot, bin))
 		defaultEnv["PATH"] = filepath.Dir(absBin) + string(os.PathListSeparator) + defaultEnv["PATH"]
 	}
 
@@ -248,7 +244,7 @@ func TestCLI(t *testing.T) {
 					"#!/bin/bash",
 					"set -e",
 					"shopt -s expand_aliases",
-					g.F("alias sling=%s", bin),
+					g.F("alias sling=%s", absBin),
 					tt.Run,
 				}
 				content := strings.Join(lines, "\n")
