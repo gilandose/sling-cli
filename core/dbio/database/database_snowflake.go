@@ -931,7 +931,15 @@ func (conn *SnowflakeConn) CopyViaStage(table Table, df *iop.Dataflow) (count ui
 
 		srcColumns := make([]string, len(df.Columns))
 		for i := range df.Columns {
-			srcColumns[i] = g.F("T.$%d", i+1)
+			// Binary columns are staged as hex text in the CSV; cast them
+			// back to BINARY so large binary values (e.g. Oracle BLOB /
+			// LONG RAW) land in a BINARY column instead of failing the
+			// implicit string conversion.
+			if i < len(columns) && columns[i].IsBinary() {
+				srcColumns[i] = g.F("TO_BINARY(T.$%d, 'HEX')", i+1)
+			} else {
+				srcColumns[i] = g.F("T.$%d", i+1)
+			}
 		}
 
 		sql := g.R(

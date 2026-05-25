@@ -930,6 +930,10 @@ func (cfg *Config) FormatTargetObjectName() (err error) {
 		} else if table.Schema == "" {
 			table.Schema = cast.ToString(cfg.Target.Data["schema"])
 		}
+
+		// clean table name as needed
+		table.Clean()
+
 		cfg.Target.Object = table.FullName()
 
 		// fill in temp table name if specified

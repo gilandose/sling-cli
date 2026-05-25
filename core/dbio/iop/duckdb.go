@@ -1146,6 +1146,37 @@ type DuckDbCopyOptions struct {
 	PartitionKey       string
 	WritePartitionCols bool
 	FileSizeBytes      int64
+	Columns            Columns // optional, used to decode hex-encoded binary back to BLOB
+}
+
+// buildSelectProjection returns the SELECT list for export. For binary columns
+// (which are streamed through CSV as hex-encoded varchar), it emits
+// `unhex(col)::BLOB AS col` so parquet output preserves true binary type.
+// If no binary columns are present, returns `*`.
+func (opts DuckDbCopyOptions) buildSelectProjection() string {
+	if len(opts.Columns) == 0 {
+		return "*"
+	}
+	hasBinary := false
+	for _, c := range opts.Columns {
+		if c.IsBinary() {
+			hasBinary = true
+			break
+		}
+	}
+	if !hasBinary {
+		return "*"
+	}
+	parts := make([]string, len(opts.Columns))
+	for i, c := range opts.Columns {
+		qName := dbio.TypeDbDuckDb.Quote(c.Name)
+		if c.IsBinary() {
+			parts[i] = g.F("unhex(%s)::BLOB AS %s", qName, qName)
+		} else {
+			parts[i] = qName
+		}
+	}
+	return strings.Join(parts, ", ")
 }
 
 func (duck *DuckDb) GenerateCopyStatement(fromTable, toLocalPath string, options DuckDbCopyOptions) (sql string, err error) {
@@ -1209,6 +1240,12 @@ func (duck *DuckDb) GenerateCopyStatement(fromTable, toLocalPath string, options
 		fileSizeBytesExpr = g.F("per_thread_output true, file_size_bytes %d,", options.FileSizeBytes)
 	}
 
+	// build SELECT projection - decodes hex back to BLOB for binary columns when exporting to parquet
+	selectExpr := "*"
+	if options.Format == dbio.FileTypeParquet {
+		selectExpr = options.buildSelectProjection()
+	}
+
 	if len(partExpressions) > 0 {
 		partSqlColumns := make([]string, len(partExpressions))
 		partSqlExpressions := make([]string, len(partExpressions))
@@ -1229,6 +1266,7 @@ func (duck *DuckDb) GenerateCopyStatement(fromTable, toLocalPath string, options
 			"partition_columns", strings.Join(partSqlColumns, ", "),
 			"compression", string(options.Compression),
 			"write_partition_columns", cast.ToString(options.WritePartitionCols),
+			"select_expr", selectExpr,
 		)
 	} else {
 		sql = g.R(
@@ -1239,6 +1277,7 @@ func (duck *DuckDb) GenerateCopyStatement(fromTable, toLocalPath string, options
 			"file_size_bytes_expr", fileSizeBytesExpr,
 			"file_extension_expr", fileExtensionExpr,
 			"compression", string(options.Compression),
+			"select_expr", selectExpr,
 		)
 	}
 
@@ -1523,6 +1562,15 @@ func (duck *DuckDb) DataflowToHttpStream(df *Dataflow, sc StreamConfig) (streamP
 	df.SetBatchLimit(sc.BatchLimit)
 	ds := MergeDataflow(df)
 
+	// Propagate TargetType from the source dataflow so CastToStringCSV knows
+	// to hex-encode binary columns destined for Snowflake / BigQuery. The
+	// caller (e.g. WriteDataflowReadyViaDuckDB) passes a default CSV config
+	// that does not preserve this — without this copy, binary BLOBs would
+	// stream as raw bytes and break DuckDB's CSV parser.
+	if sc.TargetType == "" && ds.Sp != nil && ds.Sp.Config.TargetType != "" {
+		sc.TargetType = ds.Sp.Config.TargetType
+	}
+
 	go func() {
 		defer close(streamPartChn)
 		defer func() {
@@ -1573,8 +1621,21 @@ func (duck *DuckDb) DataflowToHttpStream(df *Dataflow, sc StreamConfig) (streamP
 				// Create a pipe to stream data through
 				pipeR, pipeW := io.Pipe()
 
+				// Binary columns are streamed as hex text (2x the byte size) — a
+				// single 64 MB BLOB becomes ~128 MB on the wire. Bump max_line_size
+				// when any binary column is present so large LOBs don't blow up
+				// DuckDB's default 2 MB line limit. 256 MB covers Snowflake's
+				// 64 MB BINARY ceiling with comfortable headroom for hex + quoting.
+				maxLineSize := 2000000
+				for _, c := range batchR.Columns {
+					if c.IsBinary() {
+						maxLineSize = 256 * 1024 * 1024
+						break
+					}
+				}
+
 				// can use this as a from table
-				fromExpr := g.F(`read_csv('%s', delim=',', header=True, columns=%s, max_line_size=2000000, parallel=false, quote='"', escape='"', nullstr='\N', auto_detect=false)`, httpURL, duck.GenerateCsvColumns(batchR.Columns))
+				fromExpr := g.F(`read_csv('%s', delim=',', header=True, columns=%s, max_line_size=%d, parallel=false, quote='"', escape='"', nullstr='\N', auto_detect=false)`, httpURL, duck.GenerateCsvColumns(batchR.Columns), maxLineSize)
 
 				streamPartChn <- HttpStreamPart{
 					Index:    partIndex,

@@ -35,6 +35,7 @@ core:
       TYPE = PARQUET
       COMPRESSION = AUTO
       REPLACE_INVALID_CHARACTERS = TRUE
+      BINARY_AS_TEXT = FALSE
     )
     ON_ERROR = ABORT_STATEMENT
     MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
@@ -644,6 +645,7 @@ variable:
   column_upper: true
   max_string_type: varchar
   max_string_length: 16777216
+  max_binary_length: 67108864
 
 error_filter:
   table_not_exist: exist
@@ -684,7 +686,7 @@ native_type_map:
 
 general_type_map:
   bigint: bigint
-  binary: binary
+  binary: "binary()"
   bool: boolean
   date: date
   datetime: timestamp

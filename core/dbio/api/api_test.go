@@ -711,8 +711,10 @@ func TestHTTPCallAndResponseExtraction(t *testing.T) {
 		Env  map[string]string `yaml:"env"`
 		Err  bool              `yaml:"err"`
 
-		MockResponse      any              `yaml:"mock_response"` // can be map or string (for CSV)
+		MockResponse      any              `yaml:"mock_response"`     // can be map or string (for CSV)
+		MockResponseRaw   string           `yaml:"mock_response_raw"` // pre-serialized JSON; preserves key order
 		ExpectedRecords   []map[string]any `yaml:"expected_records"`
+		ExpectedColumns   []string         `yaml:"expected_columns"` // exact column list & order
 		ExpectedState     map[string]any   `yaml:"expected_state"`
 		ExpectedNextState map[string]any   `yaml:"expected_next_state"`
 		ExpectedStore     map[string]any   `yaml:"expected_store"`
@@ -731,6 +733,16 @@ func TestHTTPCallAndResponseExtraction(t *testing.T) {
 		t.Run(tc.Name, func(t *testing.T) {
 			// Create a test HTTP server
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// mock_response_raw: write the YAML string verbatim as the
+				// response body. Use this when key order matters (select +
+				// `*` tests rely on firstObjectKeysInOrder recovering source
+				// order from the raw bytes — a map-based mock would scramble).
+				if tc.MockResponseRaw != "" {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusOK)
+					fmt.Fprint(w, tc.MockResponseRaw)
+					return
+				}
 				// Check if MockResponse is a string (for CSV or XML format)
 				if mockStr, ok := tc.MockResponse.(string); ok {
 					// Detect format based on content
@@ -752,6 +764,24 @@ func TestHTTPCallAndResponseExtraction(t *testing.T) {
 
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
+
+				// Body-aware mock for chunk/iterate tests: echo back one record
+				// per id found in the request payload's "ids" array. This proves
+				// each distinct chunk produces distinct records (so a regression
+				// where only the first chunk loads would fail this test).
+				if strings.Contains(tc.Name, "chunk_iterate") {
+					body, _ := io.ReadAll(r.Body)
+					var reqBody struct {
+						Ids []any `json:"ids"`
+					}
+					_ = g.JSONUnmarshal(body, &reqBody)
+					data := []map[string]any{}
+					for _, id := range reqBody.Ids {
+						data = append(data, map[string]any{"id": id, "name": g.F("item_%v", id)})
+					}
+					json.NewEncoder(w).Encode(map[string]any{"data": data})
+					return
+				}
 
 				// Handle different endpoints based on path
 				switch r.URL.Path {
@@ -804,9 +834,12 @@ func TestHTTPCallAndResponseExtraction(t *testing.T) {
 			for k, v := range tc.Spec.EndpointMap["test_endpoint"].State {
 				endpoint.State[k] = v
 			}
-			endpoint.Request = Request{
-				URL:    server.URL + "/test",
-				Method: MethodGet,
+			// Point the request at the mock server, but preserve a
+			// spec-defined Method/Payload (needed for POST-based tests
+			// such as chunk/iterate). Default to GET when unset.
+			endpoint.Request.URL = server.URL + "/test"
+			if endpoint.Request.Method == "" {
+				endpoint.Request.Method = MethodGet
 			}
 
 			// Update authentication sequence URLs if present
@@ -885,6 +918,17 @@ func TestHTTPCallAndResponseExtraction(t *testing.T) {
 			// Collect data from dataflow
 			data, err := df.Collect()
 			assert.NoError(t, err)
+
+			// When the test case pins expected_columns, verify both the exact
+			// set and order — this is what `records.select` reordering tests
+			// need (map-based record assertions below can't see column order).
+			if len(tc.ExpectedColumns) > 0 {
+				gotCols := make([]string, len(data.Columns))
+				for i, c := range data.Columns {
+					gotCols[i] = c.Name
+				}
+				assert.Equal(t, tc.ExpectedColumns, gotCols, "column list / order mismatch")
+			}
 
 			// Convert rows to maps for easier comparison
 			records := []map[string]any{}

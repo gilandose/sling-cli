@@ -175,6 +175,30 @@ func (t *Table) NameQ() string {
 	return q + t.Name + q
 }
 
+func (t *Table) Clean() {
+	replace := func(old, new string) {
+		t.Database = strings.ReplaceAll(t.Database, old, new)
+		t.Schema = strings.ReplaceAll(t.Schema, old, new)
+		t.Name = strings.ReplaceAll(t.Name, old, new)
+	}
+
+	switch t.Dialect {
+	case dbio.TypeDbBigQuery:
+		// BigQuery is the strict outlier: even when backtick-quoted, table IDs
+		// must be alphanumeric + underscores (empirically verified). Strip the
+		// long tail of punctuation BQ rejects.
+		for _, c := range []string{
+			"$", ".", "/", "\\", "%", "+", "=", ":",
+			"\"", "[", "]", "<", ">", "@", "#",
+		} {
+			replace(c, "_")
+		}
+	case dbio.TypeDbOracle:
+		// Oracle quoted identifiers reject `"` (ORA-03001 unimplemented).
+		replace("\"", "_")
+	}
+}
+
 func (t *Table) FDQN() string {
 	q := GetQualifierQuote(t.Dialect)
 
@@ -1289,6 +1313,9 @@ func ParseSQLMultiStatements(sql string, Dialect ...dbio.Type) (sqls []string) {
 	// Special cases that should be treated as single statements
 	sqlLower := strings.TrimRight(strings.TrimSpace(strings.ToLower(sql)), ";")
 	if strings.HasPrefix(sqlLower, "begin") && strings.HasSuffix(sqlLower, "end") {
+		return []string{sql}
+	} else if strings.HasPrefix(sqlLower, "declare") && strings.HasSuffix(sqlLower, "end") {
+		// Oracle PL/SQL anonymous block with locals: DECLARE ... BEGIN ... END;
 		return []string{sql}
 	} else if strings.Contains(sqlLower, "prepare ") && strings.Contains(sqlLower, "execute ") {
 		return []string{sql}

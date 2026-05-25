@@ -1,0 +1,146 @@
+env:
+  OUT_DIR: /tmp/api_select_columns_test
+
+# Verifies `select` for API sources: narrows, reorders, and respects
+# spec-level `overrides.select`. Run from this directory — connection
+# API_SELECT_TEST is defined in .env.sling with a relative spec path.
+
+steps:
+  - type: log
+    message: "=== API select-columns pipeline starting ==="
+
+  - type: delete
+    location: local/{env.OUT_DIR}/
+    recursive: true
+
+  # Cases 1 & 3: stream-level `select` vs spec `overrides.select`.
+  - replication:
+      source: API_SELECT_TEST
+      target: local
+      defaults:
+        mode: full-refresh
+        object: "file://{env.OUT_DIR}/{stream_name}_selected.json"
+      streams:
+        repo:
+          select:
+            - id
+            - name
+            - full_name
+        repo_override:
+
+  # Case 1: stream-level `select` narrows to exactly the listed columns.
+  - type: read
+    from: local/{env.OUT_DIR}/repo_selected.json
+    into: selected_body
+
+  - type: log
+    message: "stream-level select output columns: {keys(json_parse(store.selected_body)[0])}"
+
+  - type: check
+    check: 'length(keys(json_parse(store.selected_body)[0])) == 3'
+    failure_message: "stream-level `select` was ignored — expected exactly 3 columns"
+
+  - type: check
+    check: 'contains(keys(json_parse(store.selected_body)[0]), "id") && contains(keys(json_parse(store.selected_body)[0]), "name") && contains(keys(json_parse(store.selected_body)[0]), "full_name")'
+    failure_message: "selected output missing one of id/name/full_name"
+
+  - type: check
+    check: '!contains(keys(json_parse(store.selected_body)[0]), "html_url")'
+    failure_message: "non-selected column `html_url` leaked into the target"
+
+  # Case 3: spec endpoint's `overrides.select` applies when stream sets none.
+  - type: read
+    from: local/{env.OUT_DIR}/repo_override_selected.json
+    into: override_body
+
+  - type: log
+    message: "spec overrides.select output columns: {keys(json_parse(store.override_body)[0])}"
+
+  - type: check
+    check: 'length(keys(json_parse(store.override_body)[0])) == 3'
+    failure_message: "spec `overrides.select` was ignored — expected exactly 3 columns"
+
+  - type: check
+    check: 'contains(keys(json_parse(store.override_body)[0]), "id") && contains(keys(json_parse(store.override_body)[0]), "name") && contains(keys(json_parse(store.override_body)[0]), "full_name")'
+    failure_message: "overrides.select output missing one of id/name/full_name"
+
+  - type: check
+    check: '!contains(keys(json_parse(store.override_body)[0]), "html_url")'
+    failure_message: "non-selected column `html_url` leaked via overrides.select"
+
+  # Case 2: exclude-only `select` drops just the excluded names.
+  - replication:
+      source: API_SELECT_TEST
+      target: local
+      defaults:
+        mode: full-refresh
+        object: "file://{env.OUT_DIR}/{stream_name}_excluded.json"
+      streams:
+        repo:
+          select:
+            - "-*_url"
+            - "-owner"
+
+  - type: read
+    from: local/{env.OUT_DIR}/repo_excluded.json
+    into: excluded_body
+
+  - type: log
+    message: "excluded output columns: {keys(json_parse(store.excluded_body)[0])}"
+
+  - type: check
+    check: 'contains(keys(json_parse(store.excluded_body)[0]), "id")'
+    failure_message: "exclude-only `select` dropped all columns"
+
+  - type: check
+    check: '!contains(keys(json_parse(store.excluded_body)[0]), "html_url") && !contains(keys(json_parse(store.excluded_body)[0]), "owner")'
+    failure_message: "excluded columns leaked into the target"
+
+  - type: check
+    check: 'length(keys(json_parse(store.excluded_body)[0])) > 3'
+    failure_message: "exclude-only `select` produced too few columns"
+
+  # Case 4: reordering via `select` — `[front, "*", back]` places pins
+  # at the ends and lets `*` fill the middle in source order.
+  - replication:
+      source: API_SELECT_TEST
+      target: local
+      defaults:
+        mode: full-refresh
+        object: "file://{env.OUT_DIR}/{stream_name}_reordered.json"
+      streams:
+        repo:
+          select:
+            - full_name
+            - id
+            - "*"
+            - html_url
+
+  - type: read
+    from: local/{env.OUT_DIR}/repo_reordered.json
+    into: reorder_body
+
+  # Order is validated against the raw bytes — json_parse → Go map loses order.
+  - type: log
+    message: "reorder output keys (parsed; order not meaningful): {keys(json_parse(store.reorder_body)[0])}"
+
+  - type: check
+    check: 'regex_match(store.reorder_body, "^\\[\\{\"full_name\":")'
+    failure_message: "reorder: expected first column to be `full_name`"
+
+  - type: check
+    check: 'regex_match(store.reorder_body, "^\\[\\{\"full_name\":[^,]*,\"id\":")'
+    failure_message: "reorder: expected second column to be `id`"
+
+  - type: check
+    check: 'regex_match(store.reorder_body, ",\"html_url\":[^,]*\\}\\]$")'
+    failure_message: "reorder: expected last column to be `html_url`"
+
+  # Generous floor: GitHub's repo endpoint emits ~85 fields; dedup or
+  # silent filtering would drop us well below.
+  - type: check
+    check: 'length(keys(json_parse(store.reorder_body)[0])) >= 80'
+    failure_message: "reorder: expected ~85 columns; got {length(keys(json_parse(store.reorder_body)[0]))}"
+
+  - type: log
+    message: "=== API select-columns pipeline passed ==="

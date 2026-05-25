@@ -1,11 +1,13 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
 	"github.com/flarco/g"
 	"github.com/samber/lo"
+	"github.com/spf13/cast"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v2"
@@ -1973,8 +1975,9 @@ endpoints:
 		assert.Equal(t, RuleTypeBreak, ep.Response.Rules[0].Action)                        // prepend
 		assert.Equal(t, RuleTypeRetry, ep.Response.Rules[1].Action)                        // default
 		assert.Equal(t, RuleTypeContinue, ep.Response.Rules[2].Action)                     // append
-		assert.Equal(t, RuleTypeRetry, ep.Response.Rules[len(ep.Response.Rules)-2].Action) // hardcoded retry
-		assert.Equal(t, RuleTypeFail, ep.Response.Rules[len(ep.Response.Rules)-1].Action)  // hardcoded fail
+		assert.Equal(t, RuleTypeRetry, ep.Response.Rules[len(ep.Response.Rules)-3].Action) // hardcoded retry
+		assert.Equal(t, RuleTypeFail, ep.Response.Rules[len(ep.Response.Rules)-2].Action)  // hardcoded JSON-RPC fail
+		assert.Equal(t, RuleTypeFail, ep.Response.Rules[len(ep.Response.Rules)-1].Action)  // hardcoded status fail
 	})
 
 	t.Run("combine explicit rules with +rules and rules+", func(t *testing.T) {
@@ -2666,4 +2669,206 @@ dynamic_endpoints:
 			assert.Equal(t, tc.iterate, s.DynamicEndpoints[0].Iterate, "string iterate should round-trip unchanged")
 		})
 	}
+}
+
+// Default rules (retry on 429/5xx, fail on >= 400) historically applied only to
+// endpoint, setup, and teardown responses. Auth sequence call responses were
+// skipped, so an OAuth token endpoint returning 401 {"error":"invalid_client"}
+// fell through to processors and died with cryptic "object has no member
+// 'access_token'" instead of failing loudly on the 401.
+func TestSpecAuthSequenceGetsDefaultRules(t *testing.T) {
+	spec := `
+name: "Auth Sequence Default Rules"
+
+defaults:
+  state:
+    base_url: "https://api.example.com"
+  request:
+    headers:
+      Authorization: "Bearer {state.token}"
+
+authentication:
+  type: "sequence"
+  expires: 270
+  sequence:
+    - request:
+        url: "https://auth.example.com/token"
+        method: POST
+        headers:
+          Content-Type: "application/x-www-form-urlencoded"
+        payload: "grant_type=client_credentials&client_id=x&client_secret=y"
+      response:
+        processors:
+          - expression: "response.json.access_token"
+            output: "state.token"
+            aggregation: last
+
+endpoints:
+  things:
+    request:
+      url: "{state.base_url}/things"
+    response:
+      records:
+        jmespath: "data[]"
+`
+
+	s, err := LoadSpec(spec)
+	require.NoError(t, err)
+
+	require.NotNil(t, s.Authentication)
+	require.Equal(t, AuthTypeSequence, s.Authentication.Type())
+
+	rawSeq, ok := s.Authentication["sequence"]
+	require.True(t, ok, "spec authentication.sequence must be present after compile")
+	authSeq := parseSequenceFromInterface(rawSeq)
+	require.Len(t, authSeq, 1)
+
+	rules := authSeq[0].Response.Rules
+	require.GreaterOrEqual(t, len(rules), 3, "auth sequence response should have at least 3 default rules appended")
+	assert.Equal(t, "Default Retry Rule", rules[len(rules)-3].Message)
+	assert.Equal(t, "JSON-RPC error response (HTTP 200 with error envelope)", rules[len(rules)-2].Message)
+	assert.Equal(t, "Default Fail Rule", rules[len(rules)-1].Message)
+	assert.Equal(t, "response.status >= 400", rules[len(rules)-1].Condition)
+}
+
+// Compiling the same spec twice (or two endpoints sharing spec.Defaults) must
+// not stack the default rules — checkResponse should be idempotent.
+func TestSpecDefaultRulesIdempotent(t *testing.T) {
+	spec := `
+name: "Idempotent Default Rules"
+
+defaults:
+  state:
+    base_url: "https://api.example.com"
+
+authentication:
+  type: "sequence"
+  sequence:
+    - request:
+        url: "https://auth.example.com/token"
+        method: POST
+      response:
+        processors:
+          - expression: "response.json.access_token"
+            output: "state.token"
+            aggregation: last
+
+endpoints:
+  a:
+    request:
+      url: "{state.base_url}/a"
+    response:
+      records:
+        jmespath: "data[]"
+  b:
+    request:
+      url: "{state.base_url}/b"
+    response:
+      records:
+        jmespath: "data[]"
+`
+
+	s, err := LoadSpec(spec)
+	require.NoError(t, err)
+
+	// Recompile both endpoints — simulates being run more than once (e.g. via
+	// ReadDataflow -> CompileSpecEndpoints / compileSpecEndpoint paths).
+	for _, name := range []string{"a", "b"} {
+		ep := s.EndpointMap[name]
+		require.NoError(t, compileSpecEndpoint(&ep, s))
+		s.EndpointMap[name] = ep
+	}
+
+	for _, name := range []string{"a", "b"} {
+		ep := s.EndpointMap[name]
+		// Endpoint response should have exactly 3 default rules (retry, jsonrpc, fail).
+		assert.Equal(t, 3, len(ep.Response.Rules), "endpoint %s should have exactly 3 default rules, got %d", name, len(ep.Response.Rules))
+	}
+
+	// Spec-level auth sequence should also have exactly 3 default rules
+	// despite being processed multiple times via compileSpecEndpoint above.
+	require.NotNil(t, s.Authentication)
+	authSeq := parseSequenceFromInterface(s.Authentication["sequence"])
+	require.Len(t, authSeq, 1)
+	assert.Equal(t, 3, len(authSeq[0].Response.Rules), "spec auth sequence should have exactly 3 default rules across multiple compiles, got %d", len(authSeq[0].Response.Rules))
+}
+
+// TestDynamicEndpointInnerIterateSurvivesRender reproduces the report that a
+// dynamic endpoint with an inner `iterate.over: chunk(...)` loop loses that
+// expression: `state.batch_ids` is never populated and `{state.batch_ids}` is
+// passed through literally in the request payload.
+//
+// renderEndpointTemplate deep-copies the endpoint template via a JSON round-trip
+// (g.Marshal -> g.Unmarshal) and builds an `originalMap` from that same JSON.
+// CompileSpecEndpoint then uses `originalMap` to decide which fields were
+// explicitly set: a field absent from originalMap is overwritten by the spec
+// default. The root cause was a wrong JSON tag on the Iterate.Over field
+// (`json:"iterate"` instead of `json:"over"`): the JSON had key `iterate`
+// instead of `over` inside the `iterate` object, so the `iterate.over` presence
+// check failed and CompileSpecEndpoint wiped Over with the (empty) default.
+// This test asserts the inner iterate.over expression survives both render and
+// compile of a dynamic endpoint.
+func TestDynamicEndpointInnerIterateSurvivesRender(t *testing.T) {
+	spec := `
+name: "Dynamic Inner Iterate API"
+defaults:
+  state:
+    base_url: "https://api.example.com"
+
+dynamic_endpoints:
+  - iterate:
+      - model: res.partner
+    into: 'state.endpoint'
+    endpoint:
+      name: '{snake(state.endpoint.model)}'
+      iterate:
+        over: 'chunk(state.item_ids, 7)'
+        into: 'state.batch_ids'
+        concurrency: 1
+      request:
+        method: POST
+        url: "{state.base_url}/{state.endpoint.model}"
+        payload:
+          ids: '{state.batch_ids}'
+      response:
+        records:
+          jmespath: "result[*]"
+`
+
+	s, err := LoadSpec(spec)
+	require.NoError(t, err)
+	require.True(t, s.IsDynamic())
+	require.Equal(t, 1, len(s.DynamicEndpoints))
+
+	dynEndpoint := s.DynamicEndpoints[0]
+
+	// Sanity-check the inner iterate.over survives loading the spec itself.
+	require.NotNil(t, dynEndpoint.Endpoint.Iterate.Over)
+	assert.Equal(t, "chunk(state.item_ids, 7)", cast.ToString(dynEndpoint.Endpoint.Iterate.Over),
+		"inner iterate.over should be preserved when loading the spec")
+
+	// renderEndpointTemplate is what RenderDynamicEndpoints calls per iteration;
+	// it deep-copies the endpoint template via a JSON round-trip.
+	ac, err := NewAPIConnection(context.Background(), s, map[string]any{})
+	require.NoError(t, err)
+
+	rendered, err := ac.renderEndpointTemplate(dynEndpoint, map[string]any{"model": "res.partner"}, nil)
+	require.NoError(t, err)
+
+	require.NotNil(t, rendered.Iterate.Over,
+		"inner iterate.over must not be lost in renderEndpointTemplate's JSON round-trip")
+	assert.Equal(t, "chunk(state.item_ids, 7)", cast.ToString(rendered.Iterate.Over),
+		"rendered dynamic endpoint must keep the inner chunk() iterate expression")
+
+	// CompileSpecEndpoint runs next in the real pipeline; it uses originalMap
+	// (built from the same JSON) to detect explicitly-set fields. With the wrong
+	// JSON tag this is where Over got reset to the empty default.
+	require.NoError(t, CompileSpecEndpoint(rendered, s))
+
+	require.NotNil(t, rendered.Iterate.Over,
+		"inner iterate.over must survive CompileSpecEndpoint (not be overwritten by default)")
+	assert.Equal(t, "chunk(state.item_ids, 7)", cast.ToString(rendered.Iterate.Over),
+		"compiled dynamic endpoint must keep the inner chunk() iterate expression")
+	assert.Equal(t, "state.batch_ids", rendered.Iterate.Into,
+		"compiled dynamic endpoint must keep the inner iterate.into target")
 }

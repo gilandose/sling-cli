@@ -1,0 +1,18 @@
+# ./sling run -r tests/replications/apis/r.stripe.yaml --streams customer,customer_balance_transaction -d --mode full-refresh
+
+source: stripe_sling
+target: postgres
+
+defaults:
+  mode: incremental
+  object: apis.{source_name}_{stream_name}
+
+  source_options:
+    flatten: 1 # flatten records 1 level only
+
+streams:
+  '*':
+
+env:
+  SLING_LOADED_AT_COLUMN: timestamp
+  SLING_THREADS: 2
