@@ -952,6 +952,41 @@ func (iter *Iteration) DetermineStateRenderOrder() (order []string, err error) {
 	return
 }
 
+func (iter *Iteration) renderInitial() (err error) {
+	// set iteration value
+	if iter.field != "" {
+		iter.SetStateVal(iter.field, iter.value)
+	}
+
+	// determine order render
+	order, err := iter.DetermineStateRenderOrder()
+	if err != nil {
+		return g.Error(err, "could not determine render order")
+	}
+
+	// render initial state with proper synchronization
+	for _, k := range order {
+		iter.context.Lock()
+		expr := cast.ToString(iter.state[k])
+		iter.context.Unlock()
+
+		if iter.hasBrackets(expr) {
+			val, err := iter.renderAny(iter.state[k])
+			if err != nil {
+				if strings.Contains(err.Error(), `"require" - input required`) {
+					return g.Error("state variable input was required but not provided: %s = %s", k, expr)
+				}
+				return g.Error(err, "could not render state var (%s) => %s", k, expr)
+			}
+			iter.context.Lock()
+			iter.state[k] = val
+			iter.context.Unlock()
+		}
+	}
+
+	return nil
+}
+
 // Iterate is for configuring looping values for requests
 type Iterate struct {
 	Over        any    `yaml:"over" json:"over,omitempty"` // expression
