@@ -360,6 +360,7 @@ type Endpoint struct {
 
 type jsonStream interface {
 	SetOrderedKeys(keys []string) // to maintain column order
+	Flatten() int                // flatten depth, to select flattened field names
 }
 
 func (ep *Endpoint) SetStateVal(key string, val any) {
