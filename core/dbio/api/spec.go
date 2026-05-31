@@ -525,6 +525,18 @@ func (ep *Endpoint) Evaluate(expr string, state map[string]interface{}) (result 
 	return ep.eval.Evaluate(expr, state, iop.GlobalFunctionMap)
 }
 
+// renderSequenceState renders the endpoint's state templates in-place, the same
+// way the main request path does via renderInitial().
+func (ep *Endpoint) renderSequenceState() error {
+	iter := &Iteration{
+		id:       g.F("seq.%s", ep.Name),
+		endpoint: ep,
+		state:    ep.State,
+		context:  g.NewContext(ep.context.Ctx),
+	}
+	return iter.renderInitial()
+}
+
 // Names returns names in alphabetical order
 func (eps Endpoints) Names() (names []string) {
 	for _, e := range eps {
