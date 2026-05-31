@@ -882,6 +882,12 @@ func (ep *Endpoint) teardown() (err error) {
 	return nil
 }
 
+func (iter *Iteration) SetStateVal(key string, val any) {
+	iter.context.Lock()
+	iter.state[key] = val
+	iter.context.Unlock()
+}
+
 func (iter *Iteration) DetermineStateRenderOrder() (order []string, err error) {
 	iter.context.Lock()
 	remaining := lo.Keys(iter.state)
