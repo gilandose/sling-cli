@@ -1507,28 +1507,30 @@ remap:
 			// Binary columns: fill the () with an explicit byte length so the
 			// target doesn't fall back to a small account-default size (which
 			// truncates large LOBs, e.g. Oracle BLOB/LONG RAW -> Snowflake).
-			// Use the sourced/known length when available, otherwise the
-			// connector's max binary length. Cap at that maximum.
 			maxBinaryLength := cast.ToInt(template.Value("variable.max_binary_length"))
+			maxBinaryType := template.Value("variable.max_binary_type")
 
 			length := col.Stats.MaxLen
 			if col.Sourced && col.DbPrecision > 0 {
 				length = col.DbPrecision
 			}
-			if length <= 0 || (maxBinaryLength > 0 && length > maxBinaryLength) {
-				// unknown or over the cap -> use the maximum the target allows
-				length = maxBinaryLength
-			}
 
-			if length > 0 {
-				nativeType = strings.ReplaceAll(
-					nativeType,
-					"()",
-					fmt.Sprintf("(%d)", length),
-				)
+			overMax := maxBinaryLength > 0 && length > maxBinaryLength
+			if (length <= 0 || overMax) && maxBinaryType != "" {
+				// unknown or over the sized limit -> use the unbounded type
+				// (e.g. varbinary(max), longblob)
+				nativeType = maxBinaryType
+			} else if length <= 0 || overMax {
+				if maxBinaryLength > 0 {
+					length = maxBinaryLength
+				}
+				if length > 0 {
+					nativeType = strings.ReplaceAll(nativeType, "()", fmt.Sprintf("(%d)", length))
+				} else {
+					nativeType = strings.ReplaceAll(nativeType, "()", "")
+				}
 			} else {
-				// no max configured for this connector; drop the ()
-				nativeType = strings.ReplaceAll(nativeType, "()", "")
+				nativeType = strings.ReplaceAll(nativeType, "()", fmt.Sprintf("(%d)", length))
 			}
 		} else if col.IsInteger() {
 			if !col.Sourced && length < env.DdlDefDecLength {

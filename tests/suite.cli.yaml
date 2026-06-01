@@ -2311,3 +2311,37 @@
     - 'SUCCESS PATH OK: all 4 children produced 30 records each'
     - 'FAIL-FAST PATH OK: group 1 failed/terminated, independent group 2 succeeded'
     - 'QUEUE STREAMING TEST PASSED'
+
+# Test MySQL binary/blob fidelity (mediumblob -> mediumblob)
+# Issue: blob types mapped to generic `text`, storing binary as mediumtext and
+# corrupting invalid UTF-8 bytes with the U+FFFD replacement char.
+# Fix: map blob types to `binary`, hex-encode binary in CSV, decode via UNHEX.
+- id: 242
+  name: 'Test MySQL binary blob fidelity'
+  run: 'sling run -d -r tests/replications/r.111.mysql_binary_blob_fidelity.yaml'
+  streams: 1
+  rows: 4
+  output_contains:
+    - 'execution succeeded'
+    - 'SUCCESS: MySQL binary blob fidelity test passed'
+
+# Test SQL Server binary fidelity (varbinary(max) round-trip)
+# Issue: binary serialized as text (BCP CSV / nvarchar bind) corrupted/truncated data.
+- id: 243
+  name: 'Test SQL Server binary fidelity'
+  run: 'sling run -d -r tests/replications/r.112.sqlserver_binary_fidelity.yaml'
+  streams: 2
+  rows: 6
+  output_contains:
+    - 'execution succeeded'
+    - 'SUCCESS: SQL Server binary fidelity test passed (bcp + cursor)'
+
+# Test Postgres binary fidelity (bytea round-trip)
+- id: 244
+  name: 'Test Postgres binary fidelity'
+  run: 'sling run -d -r tests/replications/r.113.postgres_binary_fidelity.yaml'
+  streams: 1
+  rows: 4
+  output_contains:
+    - 'execution succeeded'
+    - 'SUCCESS: Postgres binary fidelity test passed'

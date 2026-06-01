@@ -638,6 +638,7 @@ func (conn *MsSQLServerConn) BcpImportFileParrallel(tableFName string, ds *iop.D
 	}
 
 	var boolCols []int
+	hasBinaryCol := false
 	insColMap := insCols.Map()
 	for i, col := range ds.Columns {
 		insCol := g.PtrVal(insColMap[col.Name])
@@ -648,7 +649,14 @@ func (conn *MsSQLServerConn) BcpImportFileParrallel(tableFName string, ds *iop.D
 			if insCol.IsBool() || insCol.IsInteger() {
 				boolCols = append(boolCols, i)
 			}
+		case insCol.IsBinary():
+			hasBinaryCol = true
 		}
+	}
+
+	// hex-encode binary columns; bcp -w decodes the hex text into varbinary on load
+	if hasBinaryCol {
+		ds.Sp.Config.BinaryAsHex = true
 	}
 
 	// transformation to correctly post process quotes, newlines, and delimiter afterwards
@@ -810,6 +818,28 @@ func (conn *MsSQLServerConn) BcpImportFileParrallel(tableFName string, ds *iop.D
 	}
 
 	return ds.Count, ds.Err()
+}
+
+// processSQLServerInsertRow ensures binary column values are bound as []byte
+// so the driver sends them as varbinary instead of nvarchar
+func processSQLServerInsertRow(columns iop.Columns, row []any) []any {
+	for i := range row {
+		if i >= len(columns) || !columns[i].IsBinary() {
+			continue
+		}
+		switch v := row[i].(type) {
+		case nil:
+			// typed nil so the driver declares varbinary, not nvarchar(1)
+			row[i] = []byte(nil)
+		case []byte:
+			// already bytes
+		case string:
+			row[i] = []byte(v)
+		default:
+			row[i] = []byte(cast.ToString(v))
+		}
+	}
+	return row
 }
 
 func (conn *MsSQLServerConn) bcpPath() string {

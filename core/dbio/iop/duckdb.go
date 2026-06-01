@@ -1562,13 +1562,12 @@ func (duck *DuckDb) DataflowToHttpStream(df *Dataflow, sc StreamConfig) (streamP
 	df.SetBatchLimit(sc.BatchLimit)
 	ds := MergeDataflow(df)
 
-	// Propagate TargetType from the source dataflow so CastToStringCSV knows
-	// to hex-encode binary columns destined for Snowflake / BigQuery. The
-	// caller (e.g. WriteDataflowReadyViaDuckDB) passes a default CSV config
-	// that does not preserve this — without this copy, binary BLOBs would
-	// stream as raw bytes and break DuckDB's CSV parser.
+	// Propagate hex-encoding intent from the source dataflow so CastToStringCSV
 	if sc.TargetType == "" && ds.Sp != nil && ds.Sp.Config.TargetType != "" {
 		sc.TargetType = ds.Sp.Config.TargetType
+	}
+	if ds.Sp != nil && ds.Sp.Config.BinaryAsHex {
+		sc.BinaryAsHex = true
 	}
 
 	go func() {

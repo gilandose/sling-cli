@@ -357,7 +357,7 @@ func InsertBatchStream(conn Connection, tx Transaction, tableFName string, ds *i
 			case conn.GetType().IsMySQLLike():
 				row = processMySqlLikeInsertRow(bColumns, row)
 			case conn.GetType().IsSQLServer():
-				// row = processSQLServerInsertRow(bColumns, row)
+				row = processSQLServerInsertRow(bColumns, row)
 			}
 			vals = append(vals, row...)
 		}

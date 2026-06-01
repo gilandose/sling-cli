@@ -612,6 +612,7 @@ func (conn *BigQueryConn) importStreamConfig(columns iop.Columns) (config iop.St
 		fileFormat = dbio.FileTypeCsv
 	}
 	config.Format = fileFormat
+	config.BinaryAsHex = fileFormat == dbio.FileTypeCsv
 
 	// set max decimal for only numeric
 	{

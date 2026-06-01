@@ -819,10 +819,12 @@ func (conn *SnowflakeConn) CopyViaStage(table Table, df *iop.Dataflow) (count ui
 		switch fileFormat {
 		case dbio.FileTypeCsv:
 			config.Header = true
+			config.BinaryAsHex = true
 			config.Delimiter = ","
 			_, err = fs.WriteDataflowReady(df, folderPath, fileReadyChn, config)
 		case dbio.FileTypeParquet:
 			if env.UseDuckDbCompute() {
+				config.BinaryAsHex = true
 				_, err = filesys.WriteDataflowReadyViaDuckDB(fs, df, folderPath, fileReadyChn, config)
 			} else {
 				_, err = fs.WriteDataflowReady(df, folderPath, fileReadyChn, config)
