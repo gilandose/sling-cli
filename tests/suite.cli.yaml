@@ -2385,3 +2385,13 @@
   run: 'sling run -p tests/pipelines/p.36.group_concurrency.yaml'
   output_contains:
     - 'group concurrency checks passed'
+
+- id: 248
+  name: 'Test on_failure:warn sets warning status & propagates through groups'
+  run: 'sling run -p tests/pipelines/p.35.on_failure_warn_status.yaml'
+  output_contains:
+    - 'step (direct_warn) failed'
+    - 'step (group_inner_warn) failed'
+    - 'group substep 3 still ran'
+    - 'step (deep_warn) failed'
+    - 'all on_failure:warn status checks passed'

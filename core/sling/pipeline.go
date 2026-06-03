@@ -395,6 +395,13 @@ retry:
 		pse.Status = ExecStatusError
 		return g.Error(err, "error executing step: %s", pse.Step.ID())
 	}
+
+	// mark the step as warning so the status bubbles up to the overall pipeline
+	if onFail == OnFailWarn || pse.Step.Status().IsWarning() {
+		pse.Status = ExecStatusWarning
+		return nil
+	}
+
 	pse.Status = ExecStatusSuccess
 
 	return nil
