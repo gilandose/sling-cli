@@ -2379,3 +2379,9 @@
     - 'SUCCESS: bigquery column DDL verified'
     - 'SUCCESS: starrocks column DDL verified'
     - 'SUCCESS: all column DDL engine pipelines passed'
+
+- id: 247
+  name: 'Test group concurrency runs loop iterations in parallel'
+  run: 'sling run -p tests/pipelines/p.36.group_concurrency.yaml'
+  output_contains:
+    - 'group concurrency checks passed'

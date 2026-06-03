@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/flarco/g"
@@ -100,6 +101,7 @@ func (rd *ReplicationConfig) initRuntimeState(selectStreams []string) {
 			Execution: ExecutionState{},
 			Source:    ConnState{Name: rd.Source},
 			Target:    ConnState{Name: rd.Target},
+			mu:        &sync.RWMutex{},
 		}
 
 		if env.IsThreadChild {
