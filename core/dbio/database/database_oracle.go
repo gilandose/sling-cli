@@ -447,6 +447,23 @@ retry:
 	return ds.Count, err
 }
 
+// CurrentSchema returns the name of the current schema
+func (conn *OracleConn) CurrentSchema() (schemaName string, err error) {
+	if schemaName = conn.GetProp("schema"); schemaName != "" {
+		return schemaName, nil
+	}
+
+	data, err := conn.Query("SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM dual")
+	if err != nil {
+		return schemaName, g.Error(err)
+	}
+
+	schemaName = cast.ToString(data.Rows[0][0])
+	conn.SetProp("schema", schemaName)
+
+	return schemaName, nil
+}
+
 func (conn *OracleConn) getColumnsString(ds *iop.Datastream, tgtColumns ...iop.Columns) string {
 	// build lookup of target column length by name (from GetColumns/metadata)
 	tgtLength := map[string]int{}

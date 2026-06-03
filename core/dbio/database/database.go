@@ -77,6 +77,7 @@ type Connection interface {
 	CreateTable(tableName string, cols iop.Columns, tableDDL string) (err error)
 	CreateTemporaryTable(tableName string, cols iop.Columns) (err error)
 	CurrentDatabase() (string, error)
+	CurrentSchema() (string, error)
 	Db() *sqlx.DB
 	DbX() *DbX
 	DropTable(...string) error
@@ -1456,6 +1457,11 @@ func (conn *BaseConn) CurrentDatabase() (dbName string, err error) {
 	}
 
 	return
+}
+
+// CurrentSchema returns the name of the current schema
+func (conn *BaseConn) CurrentSchema() (schemaName string, err error) {
+	return conn.GetProp("schema"), nil
 }
 
 // GetDatabases returns databases for given connection

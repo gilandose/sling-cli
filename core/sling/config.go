@@ -820,6 +820,17 @@ func (cfg *Config) Prepare() (err error) {
 			if cfg.ReplicationStream != nil {
 				cfg.ReplicationStream.SQL = cfg.Source.Stream
 			}
+		} else if sTable.Name != "" && sTable.Schema == "" {
+			if dbConn, err := cfg.SrcConn.AsDatabase(); err == nil {
+				if schema, _ := dbConn.CurrentSchema(); schema != "" {
+					// normalize the injected schema's casing for the dialect
+					if schemaTable, perr := database.ParseTableName(schema+"."+sTable.Name, cfg.SrcConn.Type); perr == nil && schemaTable.Name != "" {
+						schema = schemaTable.Schema
+					}
+					sTable.Schema = schema
+					cfg.Source.Stream = sTable.FullName()
+				}
+			}
 		}
 	}
 

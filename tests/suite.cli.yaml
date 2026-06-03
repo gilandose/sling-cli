@@ -2395,3 +2395,13 @@
     - 'group substep 3 still ran'
     - 'step (deep_warn) failed'
     - 'all on_failure:warn status checks passed'
+
+- id: 249
+  name: Oracle bare table name injects schema for column lookup (https://github.com/slingdata-io/sling-cli/issues/749)
+  run: sling run -r tests/replications/r.114.oracle_no_schema_columns.yaml
+  env:
+    SCHEMA: ORACLE
+    SOURCE: ORACLE
+    TARGET: POSTGRES
+  output_contains:
+    - 'execution succeeded'
