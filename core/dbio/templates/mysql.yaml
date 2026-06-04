@@ -11,6 +11,10 @@ core:
   modify_column: '{column} {type}'
 
   # MySQL only supports insert and delete_insert (no native MERGE support)
+  # MySQL cannot reference the insert-target table in any subquery of an
+  # INSERT ... SELECT (error 1093), so a `WHERE NOT EXISTS (SELECT ... FROM tgt)`
+  # skip-existing guard is not possible here. Left as a plain INSERT; rely on a
+  # primary_key with merge_strategy update/delete_insert to avoid duplicates.
   merge_insert: |
     INSERT INTO {tgt_table} ({insert_fields})
     SELECT {src_fields} FROM {src_table} src

@@ -1580,13 +1580,14 @@
 - id: 171
   name: 'Test merge_strategy target option'
   run: 'sling run -d -r tests/replications/r.100.merge_strategy.yaml'
-  streams: 4
+  streams: 5
   output_contains:
     - 'execution succeeded'
     - 'update_insert count'
     - 'delete_insert count'
     - 'update count'
     - 'insert count'
+    - 'SUCCESS: merge_strategy insert skips existing rows (issue #755)'
 
 # Test constraint validation with value IN expressions
 # Bug: Constraints fail to abort replication when invalid data is present
