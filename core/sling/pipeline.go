@@ -30,6 +30,7 @@ type Pipeline struct {
 	state         *PipelineState
 	steps         Hooks
 	execID        string
+	outputMux     sync.Mutex
 }
 
 func LoadPipelineConfigFromFile(cfgPath string) (pipeline *Pipeline, err error) {
@@ -234,11 +235,11 @@ func (pl *Pipeline) Execute() (err error) {
 			default:
 			}
 
-			// Add to output buffer (lock since concurrent group steps may log)
-			pse.Pipeline.Context.Lock()
+			// Add to output buffer. Use a dedicated mutex (not Context.Mux)
+			pse.Pipeline.outputMux.Lock()
 			pse.Output.WriteString(ll.Line() + "\n")
 			pse.Pipeline.Output.WriteString(ll.Line() + "\n")
-			pse.Pipeline.Context.Unlock()
+			pse.Pipeline.outputMux.Unlock()
 		}
 
 		// Execute the step
