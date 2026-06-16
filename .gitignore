@@ -1,0 +1,53 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+python/sling/bin/
+
+sling-mac
+sling-linux
+sling-win.exe
+dist/
+.secrets
+.DS_Store
+demo/sling_commands_demo.workflow
+*.screenstudio
+./sling
+core/dbio/filesys/test/dataset1M.csv
+core/dbio/filesys/test/dataset100k.csv
+tests/suite/
+tests/replications/r.test.yaml
+tests/replications/r.test.2.yaml
+tests/pipelines/p.test.yaml
+
+*..go
+*..md
+*__test.go
+
+appicon.png
+wails.json
+
+cmd/sling/build/
+cmd/sling/frontend
+.cursorignore
+.sling.json
+.python-version
+pyproject.toml
+uv.lock
+test.xlsx
+.env
+AGENTS.md
+CLAUDE.md
+
+temp/

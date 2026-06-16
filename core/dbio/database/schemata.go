@@ -1,0 +1,1604 @@
+package database
+
+import (
+	"database/sql"
+	"encoding/json"
+	"regexp"
+	"runtime/debug"
+	"strconv"
+	"strings"
+	"sync"
+	"unicode"
+
+	"github.com/flarco/g"
+	"github.com/gobwas/glob"
+	"github.com/jmoiron/sqlx"
+	"github.com/samber/lo"
+	"github.com/slingdata-io/sling-cli/core/dbio"
+	"github.com/slingdata-io/sling-cli/core/dbio/iop"
+	"github.com/spf13/cast"
+)
+
+// Table represents a schemata table
+type Table struct {
+	Name        string      `json:"name"`
+	Schema      string      `json:"schema"`
+	Database    string      `json:"database,omitempty"`
+	IsView      bool        `json:"is_view,omitempty"` // whether is a view
+	Description string      `json:"description,omitempty"`
+	SQL         string      `json:"sql,omitempty"`
+	DDL         string      `json:"ddl,omitempty"`
+	Dialect     dbio.Type   `json:"dialect,omitempty"`
+	Columns     iop.Columns `json:"columns,omitempty"`
+	Keys        TableKeys   `json:"keys,omitempty"`
+
+	Raw   string `json:"raw"`
+	Where string `json:"where,omitempty"`
+
+	limit  *int
+	offset int
+}
+
+type Chunk struct {
+	RangeStart string `json:"range_start,omitempty"`
+	RangeEnd   string `json:"range_end,omitempty"`
+	Where      string `json:"where,omitempty"`
+}
+
+func (c *Chunk) Range() string {
+	if c.RangeStart == "" && c.RangeEnd == "" {
+		return ""
+	}
+	return g.F("%s,%s", c.RangeStart, c.RangeEnd)
+}
+
+var ChunkByColumn = func(conn Connection, table Table, c string, p int) ([]Table, error) {
+	return []Table{table}, g.Error("please use the official sling-cli release for chunking columns")
+}
+
+var ChunkByColumnRange = func(conn Connection, t Table, c string, cs, min, max string) ([]Chunk, error) {
+	return []Chunk{}, g.Error("please use the official sling-cli release for chunking")
+}
+
+var ChunkByCount = func(conn Connection, t Table, c string, cc int, min, max string) ([]Chunk, string, error) {
+	return []Chunk{}, "", g.Error("please use the official sling-cli release for chunking")
+}
+
+var ChunkByExpression = func(conn Connection, t Table, e string, cc int) ([]Chunk, error) {
+	return []Chunk{}, g.Error("please use the official sling-cli release for chunking")
+}
+
+func (t Table) Key() string {
+	if t.Schema == "" {
+		return strings.ToLower(t.Name)
+	}
+	return strings.ToLower(t.Schema + "." + t.Name)
+}
+
+func (t *Table) IsQuery() bool {
+	return t.SQL != ""
+}
+
+func (t *Table) IsProcedural() bool {
+	// Convert to lowercase for case-insensitive matching
+	sqlLower := strings.ToLower(t.Raw)
+
+	// declare and cursor are before select
+	declareIndex := strings.Index(sqlLower, "declare")
+	cursorIndex := strings.Index(sqlLower, "cursor")
+	selectIndex := strings.Index(sqlLower, "select")
+	hintIndex := strings.Index(sqlLower, "sling-procedural-sql")
+
+	// should be found in order DECLARE, CURSOR and SELECT
+	if declareIndex > -1 && declareIndex < cursorIndex && cursorIndex < selectIndex {
+		return true
+	}
+	if hintIndex > -1 {
+		return true
+	}
+
+	return false
+}
+
+func (t *Table) MarshalJSON() ([]byte, error) {
+	type Alias Table
+	return json.Marshal(&struct {
+		*Alias
+		FullName string `json:"full_name"`
+		FDQN     string `json:"fdqn"`
+	}{
+		Alias:    (*Alias)(t),
+		FullName: t.FullName(),
+		FDQN:     t.FDQN(),
+	})
+}
+
+func (t *Table) SetKeys(sourcePKCols []string, updateCol string, tableKeys TableKeys) error {
+	// set keys
+	t.Keys = tableKeys
+
+	eG := g.ErrorGroup{}
+
+	if len(t.Columns) == 0 {
+		return nil // columns are missing, cannot check
+	}
+
+	if len(sourcePKCols) > 0 {
+		// set true PK only when StarRocks, we don't want to create PKs on target table implicitly
+		if t.Dialect == dbio.TypeDbStarRocks {
+			eG.Capture(t.Columns.SetKeys(iop.PrimaryKey, sourcePKCols...))
+		}
+		eG.Capture(t.Columns.SetMetadata(iop.PrimaryKey.MetadataKey(), "source", sourcePKCols...))
+	}
+
+	if updateCol != "" {
+		eG.Capture(t.Columns.SetMetadata(iop.UpdateKey.MetadataKey(), "source", updateCol))
+	}
+
+	if tkMap := tableKeys; tkMap != nil {
+		for tableKey, keys := range tkMap {
+			if tableKey == iop.IndexKey {
+				// index DDL is driven by ParseIndexes (which supports composite)
+				eG.Capture(t.Columns.SetKeys(tableKey, tableKeys.IndexColumnNames()...))
+				continue
+			}
+			eG.Capture(t.Columns.SetKeys(tableKey, keys...))
+		}
+	}
+
+	return eG.Err()
+}
+
+func (t *Table) FullName() string {
+	q := GetQualifierQuote(t.Dialect)
+
+	fdqnArr := []string{}
+	if t.Schema != "" {
+		fdqnArr = append(fdqnArr, q+t.Schema+q)
+	}
+	if t.Name != "" {
+		if t.Name == "*" {
+			fdqnArr = append(fdqnArr, t.Name)
+		} else {
+			fdqnArr = append(fdqnArr, q+t.Name+q)
+		}
+	}
+	return strings.Join(fdqnArr, ".")
+}
+
+func (t *Table) DatabaseQ() string {
+	q := GetQualifierQuote(t.Dialect)
+	return q + t.Database + q
+}
+
+func (t *Table) SchemaQ() string {
+	q := GetQualifierQuote(t.Dialect)
+	return q + t.Schema + q
+}
+
+func (t *Table) NameQ() string {
+	q := GetQualifierQuote(t.Dialect)
+	return q + t.Name + q
+}
+
+func (t *Table) Clean() {
+	replace := func(old, new string) {
+		t.Database = strings.ReplaceAll(t.Database, old, new)
+		t.Schema = strings.ReplaceAll(t.Schema, old, new)
+		t.Name = strings.ReplaceAll(t.Name, old, new)
+	}
+
+	switch t.Dialect {
+	case dbio.TypeDbBigQuery:
+		// BigQuery is the strict outlier: even when backtick-quoted, table IDs
+		// must be alphanumeric + underscores (empirically verified). Strip the
+		// long tail of punctuation BQ rejects.
+		for _, c := range []string{
+			"$", ".", "/", "\\", "%", "+", "=", ":",
+			"\"", "[", "]", "<", ">", "@", "#",
+		} {
+			replace(c, "_")
+		}
+	case dbio.TypeDbOracle:
+		// Oracle quoted identifiers reject `"` (ORA-03001 unimplemented).
+		replace("\"", "_")
+	}
+}
+
+func (t *Table) FDQN() string {
+	q := GetQualifierQuote(t.Dialect)
+
+	fdqnArr := []string{}
+	if t.Database != "" {
+		fdqnArr = append(fdqnArr, q+t.Database+q)
+	}
+	if t.Schema != "" {
+		fdqnArr = append(fdqnArr, q+t.Schema+q)
+	}
+	if t.Name != "" {
+		if t.Name == "*" {
+			fdqnArr = append(fdqnArr, t.Name)
+		} else {
+			fdqnArr = append(fdqnArr, q+t.Name+q)
+		}
+	}
+	return strings.Join(fdqnArr, ".")
+}
+
+func (t *Table) Clone() Table {
+	return Table{
+		Name:        t.Name,
+		Schema:      t.Schema,
+		Database:    t.Database,
+		IsView:      t.IsView,
+		Description: t.Description,
+		SQL:         t.SQL,
+		DDL:         t.DDL,
+		Dialect:     t.Dialect,
+		Columns:     t.Columns,
+		Keys:        t.Keys,
+		Raw:         t.Raw,
+		Where:       t.Where,
+		limit:       t.limit,
+		offset:      t.offset,
+	}
+}
+
+func (t *Table) ColumnsMap() map[string]iop.Column {
+	columns := map[string]iop.Column{}
+	for _, column := range t.Columns {
+		key := strings.ToLower(column.Name)
+		columns[key] = column
+	}
+	return columns
+}
+
+type SelectOptions struct {
+	Fields []string
+	Offset int
+	Limit  *int
+	Where  string
+}
+
+func (t *Table) Select(Opts ...SelectOptions) (sql string) {
+	opts := SelectOptions{}
+	if len(Opts) > 0 {
+		opts = Opts[0]
+	}
+	// set to internal value if not specified
+	limit := lo.Ternary(opts.Limit == nil, t.limit, opts.Limit)
+	offset := lo.Ternary(opts.Offset == 0, t.offset, opts.Offset)
+	fields := opts.Fields
+
+	switch t.Dialect {
+	case dbio.TypeDbPrometheus:
+		return t.SQL
+	case dbio.TypeDbIceberg:
+		if !strings.Contains(t.SQL, "--iceberg-json=") {
+			m := g.M("table_name", t.Name, "table_schema", t.Schema, "fields_array", fields, "limit", opts.Limit)
+			t.SQL = g.F("%s\n--iceberg-json=%s", t.SQL, g.Marshal(m))
+		}
+		return t.SQL
+	case dbio.TypeDbMongoDB, dbio.TypeDbElasticsearch, dbio.TypeDbAzureTable:
+		m, _ := g.UnmarshalMap(t.SQL)
+		if m == nil {
+			m = g.M()
+		}
+		if opts.Where != "" {
+			var where any
+			switch t.Dialect {
+			case dbio.TypeDbMongoDB:
+				// isoDateRegex matches ISODate("...") patterns used in MongoDB shell syntax
+				var isoDateRegex = regexp.MustCompile(`ISODate\("([^"]+)"\)`)
+
+				// normalizeMongoWhereClause replaces MongoDB shell-specific functions with valid JSON equivalents.
+				// For example: ISODate("2025-01-01T00:00:00.000Z") => "2025-01-01T00:00:00.000Z"
+				whereStr := isoDateRegex.ReplaceAllString(opts.Where, `"$1"`)
+				g.Unmarshal(whereStr, &where)
+			default:
+				g.Unmarshal(opts.Where, &where)
+			}
+			m["filter"] = where // json array or object
+		}
+
+		if len(fields) > 0 && fields[0] != "*" {
+			m["fields"] = lo.Map(fields, func(v string, i int) string {
+				return strings.TrimSpace(v)
+			})
+		}
+
+		if opts.Limit != nil {
+			m["limit"] = opts.Limit
+		}
+
+		if len(m) > 0 {
+			return g.Marshal(m)
+		}
+		return t.SQL
+	}
+
+	isSQLServer := t.Dialect.IsSQLServer()
+	startsWith := strings.HasPrefix(strings.TrimSpace(strings.ToLower(t.SQL)), "with")
+	whereClause := lo.Ternary(opts.Where != "", g.F(" where (%s)", opts.Where), "")
+	whereAnd := lo.Ternary(opts.Where != "", g.F(" and (%s)", opts.Where), "")
+
+	shouldQuote := func(f string) bool {
+		f = strings.TrimSpace(f)
+
+		switch {
+		case strings.Contains(f, "(") || strings.EqualFold(f, "null"):
+			return false
+		case strings.EqualFold(f, "false") || strings.EqualFold(f, "true"):
+			return false
+		case strings.Contains(f, "'"):
+			// string literal (e.g. 'N/A' as status)
+			return false
+		case strings.HasPrefix(f, GetQualifierQuote(t.Dialect)):
+			// already quoted identifier
+			return false
+		case g.In(strings.ToLower(f),
+			"current_date", "current_timestamp", "current_time", "now",
+			"current_user", "session_user", "localtime", "localtimestamp", "default"):
+			// bare keyword expressions (no parens)
+			return false
+		case strings.HasPrefix(strings.ToLower(f), "case "):
+			// CASE ... END expression
+			return false
+		case strings.Contains(f, "::"):
+			// cast shorthand (e.g. 0::int)
+			return false
+		}
+		// check if number
+		if _, parseNumErr := strconv.ParseFloat(f, 64); parseNumErr == nil {
+			return false
+		}
+		return true
+	}
+
+	fields = lo.Map(fields, func(f string, i int) string {
+		q := GetQualifierQuote(t.Dialect)
+		f = strings.TrimSpace(f)
+		if f == "*" || !shouldQuote(f) {
+			return f
+		}
+
+		// Parse for "field as alias" syntax
+		original, alias, _, _ := iop.ParseSelectExpr(f)
+		if alias != "" {
+			// Generate: "original_col" AS "alias_name"
+			origQuoted := q + strings.ReplaceAll(original, q, "") + q
+			aliasQuoted := q + strings.ReplaceAll(alias, q, "") + q
+
+			if !shouldQuote(original) {
+				return original + " as " + aliasQuoted
+			}
+
+			return origQuoted + " as " + aliasQuoted
+		}
+		return q + strings.ReplaceAll(f, q, "") + q
+	})
+
+	template, err := t.Dialect.Template()
+	if err != nil {
+		return
+	}
+
+	fieldsStr := lo.Ternary(len(fields) > 0, strings.Join(fields, ", "), "*")
+
+	// auto convert complex types as needed
+	{
+		switch t.Dialect {
+		case dbio.TypeDbOracle:
+			// XMLTYPE columns cause the go-ora driver to hang when reading directly.
+			// Cast to CLOB to extract XML content as text.
+			// See: https://github.com/sijms/go-ora/issues/562
+			var xmlTypeCols iop.Columns
+			for _, col := range t.Columns {
+				if strings.EqualFold(col.DbType, "xmltype") {
+					xmlTypeCols = append(xmlTypeCols, col)
+				}
+			}
+
+			if len(xmlTypeCols) > 0 {
+				if len(fields) == 0 || (len(fields) == 1 && fields[0] == "*") {
+					// Need to explicitly list all columns with XMLTYPE casted
+					fieldExprs := []string{}
+					for _, col := range t.Columns {
+						colQ := t.Dialect.Quote(col.Name)
+						if xmlTypeCols.GetColumn(col.Name) != nil {
+							// Cast XMLTYPE to CLOB using getclobval()
+							expr := g.F("(%s).getclobval() as %s", colQ, colQ)
+							fieldExprs = append(fieldExprs, expr)
+						} else {
+							fieldExprs = append(fieldExprs, colQ)
+						}
+					}
+					fieldsStr = strings.Join(fieldExprs, ", ")
+				} else {
+					fieldExprs := []string{}
+					for _, field := range opts.Fields {
+						field = strings.TrimSpace(field)
+						colQ := t.Dialect.Quote(field)
+						if xmlTypeCols.GetColumn(field) != nil {
+							expr := g.F("(%s).getclobval() as %s", colQ, colQ)
+							fieldExprs = append(fieldExprs, expr)
+						} else {
+							fieldExprs = append(fieldExprs, colQ)
+						}
+					}
+					fieldsStr = strings.Join(fieldExprs, ", ")
+				}
+			}
+
+		case dbio.TypeDbBigQuery:
+			var toJsonCols iop.Columns
+
+			for _, col := range t.Columns {
+				dtType := strings.ToLower(col.DbType)
+				if strings.HasPrefix(dtType, "array") ||
+					strings.HasPrefix(dtType, "record") ||
+					strings.HasPrefix(dtType, "struct") {
+					toJsonCols = append(toJsonCols, col)
+				}
+			}
+
+			if len(fields) == 0 {
+				replaceExprs := []string{}
+				for _, col := range toJsonCols {
+					colQ := t.Dialect.Quote(col.Name)
+					expr := g.F("safe.parse_json(to_json_string(%s)) as %s", colQ, colQ)
+					replaceExprs = append(replaceExprs, expr)
+				}
+				if len(replaceExprs) > 0 {
+					// append replace
+					fieldsStr = g.F("* replace(%s)", strings.Join(replaceExprs, ", "))
+				}
+			} else if len(fields) == 1 && fields[0] == "*" {
+				fieldsStr = "*"
+			} else {
+				fieldsExprs := []string{}
+				for _, field := range opts.Fields {
+					field = strings.TrimSpace(field)
+					colQ := t.Dialect.Quote(field)
+					if col := toJsonCols.GetColumn(field); col != nil {
+						expr := g.F("safe.parse_json(to_json_string(%s)) as %s", colQ, colQ)
+						fieldsExprs = append(fieldsExprs, expr)
+					} else {
+						fieldsExprs = append(fieldsExprs, colQ)
+					}
+				}
+				fieldsStr = strings.Join(fieldsExprs, ", ")
+			}
+		}
+	}
+
+	if t.IsQuery() {
+		if len(fields) > 0 && !(len(fields) == 1 && fields[0] == "*") && !(isSQLServer && startsWith) {
+			sql = g.F("select %s from (\n%s\n) t", fieldsStr, t.SQL)
+		} else {
+			sql = t.SQL
+		}
+	} else {
+		if t.Dialect == dbio.TypeDbProton {
+			sql = g.F("select %s from table(%s)", fieldsStr, t.FDQN())
+		} else {
+			sql = g.F("select %s from %s", fieldsStr, t.FDQN())
+		}
+		if opts.Where != "" {
+			sql = g.F("%s where %s", sql, opts.Where)
+		}
+	}
+
+	if limit != nil && !strings.Contains(sql, "{limit}") {
+		if isSQLServer && startsWith {
+			// leave it alone since it starts with WITH
+		} else if t.IsQuery() {
+			sql = g.R(
+				template.Core["limit_sql"],
+				"sql", sql,
+				"where_cond", opts.Where,
+				"where_clause", whereClause,
+				"where_and", whereAnd,
+				"limit", cast.ToString(limit),
+				"offset", cast.ToString(offset),
+			)
+		} else {
+			key := lo.Ternary(offset > 0, "limit_offset", "limit")
+			sql = g.R(
+				template.Core[key],
+				"fields", fieldsStr,
+				"table", t.FDQN(),
+				"where_cond", opts.Where,
+				"where_clause", whereClause,
+				"where_and", whereAnd,
+				"limit", cast.ToString(limit),
+				"offset", cast.ToString(offset),
+			)
+		}
+	}
+
+	// replace any provided placeholders
+	sql = g.R(sql,
+		"limit", cast.ToString(limit),
+		"offset", cast.ToString(offset),
+		"where_cond", opts.Where,
+		"where_clause", whereClause,
+		"where_and", whereAnd,
+		"fields", fieldsStr,
+	)
+
+	return
+}
+
+// Database represents a schemata database
+type Database struct {
+	Name    string            `json:"name"`
+	Schemas map[string]Schema `json:"schemas"`
+}
+
+func (db *Database) Tables() map[string]Table {
+	tables := map[string]Table{}
+	for _, schema := range db.Schemas {
+		for _, table := range schema.Tables {
+			key := strings.ToLower(g.F("%s.%s", schema.Name, table.Name))
+			tables[key] = table
+		}
+	}
+	return tables
+}
+
+func (db *Database) Columns() map[string]iop.Column {
+	columns := map[string]iop.Column{}
+	for _, schema := range db.Schemas {
+		for _, table := range schema.Tables {
+			for _, column := range table.Columns {
+				key := strings.ToLower(g.F("%s.%s.%s", schema.Name, table.Name, column.Name))
+				columns[key] = column
+			}
+		}
+	}
+	return columns
+}
+
+// Schema represents a schemata schema
+type Schema struct {
+	Name     string           `json:"name"`
+	Database string           `json:"database"`
+	Tables   map[string]Table `json:"tables"`
+}
+
+func (schema *Schema) Columns() map[string]iop.Column {
+	columns := map[string]iop.Column{}
+	for _, table := range schema.Tables {
+		for _, column := range table.Columns {
+			key := strings.ToLower(g.F("%s.%s", table.Name, column.Name))
+			columns[key] = column
+		}
+	}
+	return columns
+}
+
+// ToData converts schema objects to tabular format
+func (schema *Schema) ToData() (data iop.Dataset) {
+	columns := []string{"schema_name", "table_name", "is_view", "column_id", "column_name", "column_type"}
+	data = iop.NewDataset(iop.NewColumnsFromFields(columns...))
+
+	for _, table := range schema.Tables {
+		for _, col := range table.Columns {
+			row := []interface{}{schema.Name, table.Name, table.IsView, col.Position, col.Name, col.DbType}
+			data.Rows = append(data.Rows, row)
+		}
+	}
+	return
+}
+
+type SchemataLevel string
+
+const (
+	SchemataLevelSchema SchemataLevel = "schema"
+	SchemataLevelTable  SchemataLevel = "table"
+	SchemataLevelColumn SchemataLevel = "column"
+)
+
+// Schemata contains the full schema for a connection
+type Schemata struct {
+	Databases map[string]Database `json:"databases"`
+	conn      Connection          `json:"-"`
+}
+
+// LoadTablesJSON loads from a json string
+func (s *Schemata) LoadTablesJSON(payload string) error {
+	tables := map[string]Table{}
+	err := g.Unmarshal(payload, &tables)
+	if err != nil {
+		return g.Error(err, "could not unmarshal TablesJSON")
+	}
+
+	// reconstruct data
+	databases := map[string]Database{}
+	for key, table := range tables {
+		keyArr := strings.Split(key, ".")
+		if len(keyArr) != 3 {
+			return g.Error("table key must be formatted as `database.schema.table`, got `%s`", key)
+		}
+
+		databaseName := strings.ToLower(keyArr[0])
+		schemaName := strings.ToLower(keyArr[1])
+		tableName := strings.ToLower(keyArr[2])
+
+		if _, ok := databases[databaseName]; !ok {
+			databases[databaseName] = Database{
+				Name:    table.Database,
+				Schemas: map[string]Schema{},
+			}
+		}
+		database := databases[databaseName]
+
+		if _, ok := database.Schemas[schemaName]; !ok {
+			database.Schemas[schemaName] = Schema{
+				Name:   table.Schema,
+				Tables: map[string]Table{},
+			}
+		}
+		schema := database.Schemas[schemaName]
+
+		// fill in positions
+		for i := range table.Columns {
+			table.Columns[i].Position = i + 1
+		}
+
+		// store data
+		schema.Tables[tableName] = table
+		database.Schemas[schemaName] = schema
+		databases[databaseName] = database
+	}
+
+	s.Databases = databases
+
+	return nil
+}
+
+// Database returns the first encountered database
+func (s *Schemata) Database() Database {
+	for _, db := range s.Databases {
+		return db
+	}
+	return Database{}
+}
+
+func (s *Schemata) Tables(filters ...string) map[string]Table {
+	tables := map[string]Table{}
+	for _, db := range s.Databases {
+		for _, schema := range db.Schemas {
+			for _, table := range schema.Tables {
+				if len(filters) == 0 || g.IsMatched(filters, table.Name) {
+					key := strings.ToLower(g.F("%s.%s.%s", db.Name, schema.Name, table.Name))
+					tables[key] = table
+				}
+			}
+		}
+	}
+	return tables
+}
+
+func (s *Schemata) Columns(filters ...string) map[string]iop.Column {
+	columns := map[string]iop.Column{}
+	for _, db := range s.Databases {
+		for _, schema := range db.Schemas {
+			for _, table := range schema.Tables {
+				for _, column := range table.Columns {
+					if len(filters) == 0 || g.IsMatched(filters, column.Name) {
+						if !column.Type.IsValid() {
+							// get general type
+							column.Type = NativeTypeToGeneral(column.Name, column.DbType, s.conn)
+						}
+						column.SetLengthPrecisionScale()
+						key := strings.ToLower(g.F("%s.%s.%s.%s", db.Name, schema.Name, table.Name, column.Name))
+						columns[key] = column
+					}
+				}
+			}
+		}
+	}
+	return columns
+}
+
+func (s *Schemata) Filtered(columnLevel bool, filters ...string) (ns Schemata) {
+	if columnLevel {
+		return s.filterColumns(filters...)
+	}
+	return s.filterTables(filters...)
+}
+
+func (s *Schemata) filterTables(filters ...string) (ns Schemata) {
+	ns = Schemata{Databases: map[string]Database{}, conn: s.conn}
+
+	var gc *glob.Glob
+	if len(filters) == 0 {
+		return *s
+	} else if len(filters) == 1 && (strings.Contains(filters[0], "*") || strings.Contains(filters[0], "?")) {
+		val, err := glob.Compile(strings.ToLower(filters[0]))
+		if err == nil {
+			gc = &val
+		}
+	}
+
+	matchedTables := lo.Filter(lo.Values(s.Tables()), func(t Table, i int) bool {
+		key := strings.ToLower(g.F("%s.%s", t.Schema, t.Name))
+		if gc != nil {
+			return (*gc).Match(key)
+		}
+		return g.IsMatched(filters, key)
+	})
+
+	if len(matchedTables) == 0 {
+		return
+	}
+
+	for _, table := range matchedTables {
+		db, ok := ns.Databases[strings.ToLower(table.Database)]
+		if !ok {
+			db = Database{
+				Name:    table.Database,
+				Schemas: map[string]Schema{},
+			}
+		}
+
+		schema, ok := db.Schemas[strings.ToLower(table.Schema)]
+		if !ok {
+			schema = Schema{
+				Name:   table.Schema,
+				Tables: map[string]Table{},
+			}
+		}
+
+		if _, ok := schema.Tables[strings.ToLower(table.Name)]; !ok {
+			schema.Tables[strings.ToLower(table.Name)] = table
+		}
+
+		db.Schemas[strings.ToLower(table.Schema)] = schema
+		ns.Databases[strings.ToLower(table.Database)] = db
+	}
+
+	return ns
+}
+
+func (s *Schemata) filterColumns(filters ...string) (ns Schemata) {
+	ns = Schemata{Databases: map[string]Database{}, conn: s.conn}
+
+	var gc *glob.Glob
+	if len(filters) == 0 {
+		return *s
+	} else if len(filters) == 1 && (strings.Contains(filters[0], "*") || strings.Contains(filters[0], "?")) {
+		val, err := glob.Compile(strings.ToLower(filters[0]))
+		if err == nil {
+			gc = &val
+		}
+	}
+
+	matchedColumns := lo.Filter(lo.Values(s.Columns()), func(col iop.Column, i int) bool {
+		keyTable := strings.ToLower(g.F("%s.%s", col.Schema, col.Table))
+		keyCol := strings.ToLower(g.F("%s.%s.%s", col.Schema, col.Table, col.Name))
+		if gc != nil {
+			return (*gc).Match(keyCol)
+		}
+		return g.IsMatched(filters, keyCol) || g.IsMatched(filters, keyTable)
+	})
+
+	if len(matchedColumns) == 0 {
+		return
+	}
+
+	for _, col := range matchedColumns {
+		db, ok := ns.Databases[strings.ToLower(col.Database)]
+		if !ok {
+			db = Database{
+				Name:    col.Database,
+				Schemas: map[string]Schema{},
+			}
+		}
+
+		schema, ok := db.Schemas[strings.ToLower(col.Schema)]
+		if !ok {
+			schema = Schema{
+				Name:   col.Schema,
+				Tables: map[string]Table{},
+			}
+		}
+
+		table, ok := schema.Tables[strings.ToLower(col.Table)]
+		if !ok {
+			table = Table{
+				Name: col.Table,
+			}
+		}
+
+		table.Columns = append(table.Columns, col)
+
+		schema.Tables[strings.ToLower(col.Table)] = table
+		db.Schemas[strings.ToLower(col.Schema)] = schema
+		ns.Databases[strings.ToLower(col.Database)] = db
+	}
+
+	return ns
+}
+
+type ColumnType struct {
+	Name             string
+	DatabaseTypeName string
+	FetchedColumn    *iop.Column
+	Length           int
+	Precision        int
+	Scale            int
+	Nullable         bool
+	CT               *sql.ColumnType
+	Sourced          bool
+}
+
+func (ct *ColumnType) IsSourced() bool {
+	if ct.Sourced {
+		return true
+	}
+
+	if ct.CT != nil {
+		_, ok1 := ct.CT.Length()
+		_, _, ok2 := ct.CT.DecimalSize()
+		if g.In(strings.ToLower(ct.DatabaseTypeName), "uuid", "uniqueidentifier") {
+			return true
+		}
+		return lo.Ternary(ok1, ok1, ok2)
+	}
+	return ct.Sourced
+}
+
+func ParseTableName(text string, dialect dbio.Type) (table Table, err error) {
+	table.Dialect = dialect
+	table.Raw = text
+
+	quote := GetQualifierQuote(dialect)
+
+	textLower := strings.ToLower(text)
+	if strings.Contains(textLower, "select") && strings.Contains(textLower, "from") && (strings.Contains(text, " ") || strings.Contains(text, "\n")) && !strings.Contains(text, quote) {
+		table.SQL = strings.TrimSpace(text)
+		return
+	}
+
+	inQuote := false
+	words := []string{}
+	word := ""
+
+	addWord := func(caseAsIs bool) {
+		if word == "" {
+			return
+		}
+
+		var hasUpper, hasSpecial bool
+
+		for _, r := range word {
+			if unicode.IsUpper(r) {
+				hasUpper = true
+			}
+		}
+
+		defCaseAsIs := hasUpper || hasSpecial
+		if caseAsIs || defCaseAsIs {
+		} else {
+			word = lo.Ternary(dialect.DBNameUpperCase(), strings.ToUpper(word), strings.ToLower(word))
+		}
+		words = append(words, word)
+		word = ""
+	}
+
+	for _, r := range text {
+		c := string(r)
+
+		switch c {
+		case quote:
+			if inQuote {
+				addWord(true)
+			}
+			inQuote = !inQuote
+			continue
+		case ".":
+			if !inQuote {
+				addWord(false)
+				continue
+			}
+		case " ", "\n", "\t", "\r", "(", ")", "'":
+			if !inQuote {
+				table.SQL = strings.TrimSpace(text)
+				return
+			}
+		}
+
+		word = word + c
+	}
+
+	if inQuote {
+		return table, g.Error("unterminated qualifier quote")
+	} else if word != "" {
+		addWord(false)
+	}
+
+	if len(words) == 0 {
+		err = g.Error("invalid table name: %s", text)
+		return
+	} else if len(words) == 1 {
+		table.Name = words[0]
+	} else if len(words) == 2 {
+		table.Schema = words[0]
+		table.Name = words[1]
+	} else if len(words) == 3 {
+		table.Database = words[0]
+		table.Schema = words[1]
+		table.Name = words[2]
+	} else {
+		table.SQL = strings.TrimSpace(text)
+	}
+
+	return
+}
+
+func ParseColumnName(text string, dialect dbio.Type) (colName string, err error) {
+
+	quote := GetQualifierQuote(dialect)
+
+	inQuote := false
+	words := []string{}
+	word := ""
+
+	addWord := func(caseAsIs bool) {
+		if word == "" {
+			return
+		}
+
+		var hasLower, hasUpper, hasSpecial bool
+
+		for _, r := range word {
+			if unicode.IsUpper(r) {
+				hasUpper = true
+			} else if unicode.IsLower(r) {
+				hasLower = true
+			}
+		}
+
+		defCaseAsIs := (hasLower && hasUpper) || hasSpecial
+		if caseAsIs || defCaseAsIs {
+		} else {
+			word = lo.Ternary(dialect.DBNameUpperCase(), strings.ToUpper(word), strings.ToLower(word))
+		}
+		words = append(words, word)
+		word = ""
+	}
+
+	for _, r := range text {
+		c := string(r)
+
+		switch c {
+		case quote:
+			if inQuote {
+				addWord(true)
+			}
+			inQuote = !inQuote
+			continue
+		case ".":
+			if !inQuote {
+				addWord(false)
+				continue
+			}
+		case " ", "\n", "\t", "\r", "(", ")", "'":
+			if !inQuote {
+				err = g.Error("invalid character: %#v", c)
+				return
+			}
+		}
+
+		word = word + c
+	}
+
+	if inQuote {
+		return colName, g.Error("unterminated qualifier quote")
+	} else if word != "" {
+		addWord(false)
+	}
+
+	if len(words) == 0 {
+		err = g.Error("invalid column name")
+	} else {
+		colName = words[len(words)-1]
+	}
+
+	return
+}
+
+// getColumnsProp returns the coercedCols from the columns property
+func getColumnsProp(conn Connection) (coerceCols iop.Columns, ok bool) {
+	if coerceColsV := conn.GetProp("columns"); coerceColsV != "" {
+		if err := g.Unmarshal(coerceColsV, &coerceCols); err == nil {
+			return coerceCols, true
+		}
+	}
+	return coerceCols, false
+}
+
+// getColumnsProp returns the colCasing from the column_casing property
+func getColumnCasingProp(conn Connection) (colCasing iop.ColumnCasing, ok bool) {
+	if colCasingV := conn.GetProp("column_casing"); colCasingV != "" {
+		if err := g.Unmarshal(colCasingV, &colCasing); err == nil {
+			return colCasing, true
+		}
+	}
+	return colCasing, false
+}
+
+func GetQualifierQuote(dialect dbio.Type) string {
+	quote := `"`
+	switch dialect {
+	case dbio.TypeDbMySQL, dbio.TypeDbMariaDB, dbio.TypeDbStarRocks, dbio.TypeDbBigQuery, dbio.TypeDbClickhouse, dbio.TypeDbProton, dbio.TypeDbAthena, dbio.TypeDbDatabricks:
+		quote = "`"
+	case dbio.TypeDbBigTable, dbio.TypeDbMongoDB, dbio.TypeDbPrometheus:
+		quote = ""
+	}
+	return quote
+}
+
+// GetTablesSchemata obtains the schemata for specified tables
+func GetTablesSchemata(conn Connection, tableNames ...string) (schemata Schemata, err error) {
+	schemata = Schemata{Databases: map[string]Database{}}
+
+	schemaTableGroups := map[string][]Table{}
+	for _, tableName := range tableNames {
+		table, err := ParseTableName(tableName, conn.GetType())
+		if err != nil {
+			return schemata, g.Error(err, "could not parse table: %s", tableName)
+		}
+		if arr, ok := schemaTableGroups[table.Schema]; ok {
+			schemaTableGroups[table.Schema] = append(arr, table)
+		} else {
+			schemaTableGroups[table.Schema] = []Table{table}
+		}
+	}
+
+	getSchemata := func(schema string, tables []Table) {
+		defer conn.Context().Wg.Read.Done()
+
+		// pull down schemata
+		names := lo.Map(tables, func(t Table, i int) string { return t.Name })
+		newSchemata, err := conn.GetSchemata(SchemataLevelColumn, schema, names...)
+		if err != nil {
+			g.Warn("could not obtain schemata for schema: %s. %s", schema, err)
+			return
+		}
+
+		// merge all schematas
+		database := schemata.Database()
+		schemas := database.Schemas
+		if len(schemas) == 0 {
+			schemas = map[string]Schema{}
+		}
+
+		for name, schema := range newSchemata.Database().Schemas {
+			g.Debug(
+				"   collected %d columns, in %d tables/views from schema %s",
+				len(schema.Columns()),
+				len(schema.Tables),
+				schema.Name,
+			)
+			schemas[name] = schema
+		}
+		database.Schemas = schemas
+		schemata.Databases[strings.ToLower(schemata.Database().Name)] = database
+	}
+
+	// loop an connect to each
+	for schema, tables := range schemaTableGroups {
+		conn.Context().Wg.Read.Add()
+		go getSchemata(schema, tables)
+	}
+
+	conn.Context().Wg.Read.Wait()
+
+	return schemata, nil
+}
+
+// GetSchemataAll obtains the schemata for all databases detected
+func GetSchemataAll(conn Connection) (schemata Schemata, err error) {
+	schemata = Schemata{Databases: map[string]Database{}}
+	var mu sync.Mutex
+
+	connInfo := conn.Info()
+
+	// get all databases
+	data, err := conn.GetDatabases()
+	if err != nil {
+		err = g.Error(err, "could not obtain list of databases")
+		return
+	}
+	dbNames := data.ColValuesStr(0)
+
+	getSchemata := func(dbName string) {
+		defer conn.Context().Wg.Read.Done()
+
+		// create new connection for database
+		g.Debug("getting schemata for database: %s", dbName)
+
+		// remove schema if specified
+		connInfo.URL.PopParam("schema")
+
+		// replace database with new one
+		connURL := strings.ReplaceAll(
+			connInfo.URL.String(),
+			"/"+connInfo.Database,
+			"/"+dbName,
+		)
+
+		newConn, err := NewConn(connURL)
+		if err != nil {
+			g.Warn("could not connect using database %s. %s", dbName, err)
+			return
+		}
+
+		// pull down schemata
+		newSchemata, err := newConn.GetSchemata(SchemataLevelColumn, "")
+		if err != nil {
+			g.Warn("could not obtain schemata for database: %s. %s", dbName, err)
+			return
+		}
+
+		// merge all schematas with mutex protection
+		mu.Lock()
+		for name, database := range newSchemata.Databases {
+			g.Debug(
+				"   collected %d columns, in %d tables/views from database %s",
+				len(database.Columns()),
+				len(database.Tables()),
+				database.Name,
+			)
+			schemata.Databases[name] = database
+		}
+		mu.Unlock()
+	}
+
+	// loop an connect to each
+	for _, dbName := range dbNames {
+		conn.Context().Wg.Read.Add()
+		go getSchemata(dbName)
+	}
+
+	conn.Context().Wg.Read.Wait()
+
+	return schemata, nil
+}
+
+// AddPrimaryKeyToDDL adds a primary key to the table
+// ColumnCommentsDDL returns COMMENT/description statements for columns that
+// carry an explicit description (set via the `description(...)` column modifier).
+// These are applied post-CREATE so that descriptions render on fresh tables even
+// when schema-migration is disabled. Returns an empty slice when the dialect has
+// no add_column_comment template or no explicit descriptions exist.
+func (t *Table) ColumnCommentsDDL(conn Connection, columns iop.Columns) (stmts []string) {
+	addCommentTemplate := conn.Template().Core["add_column_comment"]
+	if addCommentTemplate == "" {
+		return nil
+	}
+
+	for _, col := range columns {
+		// only apply for columns that explicitly declared a description via the modifier DSL
+		if !col.IsDDLExplicit() {
+			continue
+		}
+		description := col.Metadata[iop.ColMetaDescription.String()]
+		if description == "" {
+			description = col.Description
+		}
+		if description == "" {
+			continue
+		}
+
+		// Escape single quotes
+		escapedDesc := strings.ReplaceAll(description, "'", "''")
+
+		// For MySQL/MariaDB the template needs the full column type definition
+		colType := col.DbType
+		if g.In(conn.GetType(), dbio.TypeDbMySQL, dbio.TypeDbMariaDB) {
+			if nativeType, err := conn.Self().GetNativeType(col); err == nil {
+				colType = nativeType
+			}
+		}
+
+		stmt := g.R(
+			addCommentTemplate,
+			"table", t.FullName(),
+			"schema", t.Schema,
+			"table_name", t.Name,
+			"column", col.Name,
+			"comment", "'"+escapedDesc+"'",
+			"type", colType,
+		)
+		stmts = append(stmts, stmt)
+	}
+	return stmts
+}
+
+var createTableRegex = regexp.MustCompile(`(?i)create\s+(?:temp\s+|temporary\s+)?table`)
+
+func (t *Table) AddPrimaryKeyToDDL(ddl string, columns iop.Columns) (string, error) {
+
+	if pkCols := columns.GetKeys(iop.PrimaryKey); len(pkCols) > 0 {
+		ddl = strings.TrimSpace(ddl)
+
+		// anchor on the CREATE [TEMP|TEMPORARY] TABLE keyword to start the column-list search
+		loc := createTableRegex.FindStringIndex(ddl)
+		if loc == nil {
+			return ddl, g.Error("could not find CREATE TABLE in DDL")
+		}
+		createTableIdx := loc[0]
+
+		// Find the opening paren after CREATE TABLE (this is the column list)
+		openParen := strings.Index(ddl[createTableIdx:], "(")
+		if openParen == -1 {
+			return ddl, g.Error("could not find opening parenthesis for column list")
+		}
+		openParen += createTableIdx
+
+		// Find the matching closing paren by counting balanced parens
+		depth := 1
+		closeParen := -1
+		for i := openParen + 1; i < len(ddl); i++ {
+			switch ddl[i] {
+			case '(':
+				depth++
+			case ')':
+				depth--
+				if depth == 0 {
+					closeParen = i
+				}
+			}
+			if closeParen != -1 {
+				break
+			}
+		}
+
+		if closeParen == -1 {
+			return ddl, g.Error("could not find closing parenthesis for column list")
+		}
+
+		prefix := "primary key"
+		suffix := ""
+		switch t.Dialect {
+		case dbio.TypeDbOracle:
+			prefix = g.F("constraint %s_pkey primary key", strings.ToLower(t.Name))
+		case dbio.TypeDbBigQuery:
+			// BigQuery requires NOT ENFORCED for primary keys
+			suffix = " not enforced"
+		}
+
+		quotedNames := t.Dialect.QuoteNames(pkCols.Names()...)
+		ddl = ddl[:closeParen] + g.F(", %s (%s)%s", prefix, strings.Join(quotedNames, ", "), suffix) + ddl[closeParen:]
+	}
+
+	return ddl, nil
+}
+
+// getColumnTypes recovers from ColumnTypes panics
+// this can happen in the Microsoft go-mssqldb driver
+// See https://github.com/microsoft/go-mssqldb/issues/79
+func getColumnTypes(result *sqlx.Rows) (dbColTypes []*sql.ColumnType, err error) {
+
+	// recover from panic
+	defer func() {
+		if r := recover(); r != nil {
+			err = g.Error(g.F("panic occurred! %#v\n%s", r, string(debug.Stack())))
+		}
+	}()
+
+	return result.ColumnTypes()
+}
+
+// ParseSQLMultiStatements splits a sql text into statements
+// typically by a ';'
+func ParseSQLMultiStatements(sql string, Dialect ...dbio.Type) (sqls []string) {
+	var dialect dbio.Type
+	if len(Dialect) > 0 {
+		dialect = Dialect[0]
+	}
+
+	// Special cases that should be treated as single statements
+	sqlLower := strings.TrimRight(strings.TrimSpace(strings.ToLower(sql)), ";")
+	if strings.HasPrefix(sqlLower, "begin") && strings.HasSuffix(sqlLower, "end") {
+		return []string{sql}
+	} else if strings.HasPrefix(sqlLower, "declare") && strings.HasSuffix(sqlLower, "end") {
+		// Oracle PL/SQL anonymous block with locals: DECLARE ... BEGIN ... END;
+		return []string{sql}
+	} else if strings.Contains(sqlLower, "prepare ") && strings.Contains(sqlLower, "execute ") {
+		return []string{sql}
+	} else if strings.Contains(sqlLower, "create procedure") || strings.Contains(sqlLower, "create function") {
+		return []string{sql}
+	}
+
+	inQuote := false
+	inCommentLine := false
+	inCommentMulti := false
+	currStatement := strings.Builder{}
+
+	// Process character by character
+	for i := 0; i < len(sql); i++ {
+		char := sql[i]
+
+		// Write current character to the statement buffer
+		currStatement.WriteByte(char)
+
+		// Handle state changes (after writing the character)
+		if !inCommentLine && !inCommentMulti {
+			// Handle quotes
+			if char == '\'' && !inQuote {
+				inQuote = true
+			} else if char == '\'' && inQuote {
+				// Check for escaped quote (''), which means stay in quote
+				if i+1 < len(sql) && sql[i+1] == '\'' {
+					// Add the next quote now and skip it in the next iteration
+					currStatement.WriteByte(sql[i+1])
+					i++
+					continue
+				}
+				inQuote = false
+			}
+		}
+
+		// Handle comments (only if not in a quote)
+		if !inQuote {
+			// Line comment start
+			if i > 0 && char == '-' && sql[i-1] == '-' && !inCommentMulti {
+				inCommentLine = true
+			}
+
+			// Multi-line comment start
+			if i > 0 && char == '*' && sql[i-1] == '/' && !inCommentLine {
+				inCommentMulti = true
+			}
+
+			// Multi-line comment end
+			if i > 0 && char == '/' && sql[i-1] == '*' && inCommentMulti {
+				inCommentMulti = false
+			}
+		}
+
+		// End of line comment
+		if char == '\n' && inCommentLine {
+			inCommentLine = false
+		}
+
+		// Detect statement end with semicolon (only when not in comment or quote)
+		if char == ';' && !inQuote && !inCommentLine && !inCommentMulti {
+			statement := strings.TrimSpace(currStatement.String())
+			if statement != "" && statement != ";" {
+				// Remove trailing semicolon for certain databases
+				if !dialect.IsSQLServer() {
+					statement = strings.TrimSuffix(statement, ";")
+				}
+				sqls = append(sqls, statement)
+				currStatement.Reset()
+			} else {
+				currStatement.Reset()
+			}
+		}
+	}
+
+	// Handle any remaining statement
+	if remaining := strings.TrimSpace(currStatement.String()); remaining != "" {
+		// Remove trailing semicolon for certain databases
+		if !dialect.IsSQLServer() {
+			remaining = strings.TrimSuffix(remaining, ";")
+		}
+		sqls = append(sqls, remaining)
+	}
+
+	return
+}
+
+// TrimSQLComments removes all SQL comments (line and block comments) from the input SQL
+// Line comments start with -- and end with a newline
+// Block comments start with /* and end with */
+func TrimSQLComments(sql string) (string, error) {
+	inQuote := false
+	inCommentLine := false
+	inCommentMulti := false
+	result := strings.Builder{}
+
+	// Process character by character
+	for i := 0; i < len(sql); i++ {
+		char := sql[i]
+
+		// Handle state changes
+		if !inCommentLine && !inCommentMulti {
+			// Handle quotes
+			if char == '\'' && !inQuote {
+				inQuote = true
+				result.WriteByte(char)
+			} else if char == '\'' && inQuote {
+				// Check for escaped quote (''), which means stay in quote
+				if i+1 < len(sql) && sql[i+1] == '\'' {
+					// Add both quotes and skip the next one in the next iteration
+					result.WriteByte(char)
+					result.WriteByte(sql[i+1])
+					i++
+					continue
+				}
+				inQuote = false
+				result.WriteByte(char)
+			} else if inQuote {
+				// Inside quotes, keep all characters
+				result.WriteByte(char)
+			} else {
+				// Outside quotes, check for comment starts
+				if i+1 < len(sql) && char == '-' && sql[i+1] == '-' {
+					// Line comment start, don't add these characters
+					inCommentLine = true
+					i++ // Skip the next dash
+				} else if i+1 < len(sql) && char == '/' && sql[i+1] == '*' {
+					// Multi-line comment start, don't add these characters
+					inCommentMulti = true
+					i++ // Skip the star
+				} else {
+					// Not in a comment and not starting one, add character
+					result.WriteByte(char)
+				}
+			}
+		} else if inCommentLine {
+			// In line comment, look for end (newline)
+			if char == '\n' {
+				inCommentLine = false
+				result.WriteByte(char) // Keep the newline
+			}
+			// Else discard comment characters
+		} else if inCommentMulti {
+			// In multi-line comment, look for end (*/)
+			if i+1 < len(sql) && char == '*' && sql[i+1] == '/' {
+				inCommentMulti = false
+				i++ // Skip the slash
+			}
+			// Else discard comment characters
+		}
+	}
+
+	// Check if we have an unterminated comment or quote
+	if inQuote {
+		return "", g.Error("unterminated quote")
+	} else if inCommentMulti {
+		return "", g.Error("unterminated block comment")
+	}
+
+	return result.String(), nil
+}
+
+// GenerateAlterDDL generate a DDL based on a dataset
+func GenerateAlterDDL(conn Connection, table Table, newColumns iop.Columns) (bool, error) {
+
+	if len(table.Columns) != len(newColumns) {
+		return false, g.Error("different column lenght %d != %d", len(table.Columns), len(newColumns))
+	}
+
+	colDDLs := []string{}
+	for i, col := range table.Columns {
+		newCol := newColumns[i]
+
+		if col.Type == newCol.Type {
+			continue
+		}
+
+		// convert from general type to native type
+		nativeType, err := conn.GetNativeType(newCol)
+		if err != nil {
+			return false, g.Error(err, "no native mapping")
+		}
+
+		switch {
+		case col.Type.IsString():
+			// alter field to resize column
+			colDDL := g.R(
+				conn.GetTemplateValue("core.modify_column"),
+				"column", conn.Self().Quote(col.Name),
+				"type", nativeType,
+			)
+			colDDLs = append(colDDLs, colDDL)
+		default:
+			// alter field to resize column
+			colDDL := g.R(
+				conn.GetTemplateValue("core.modify_column"),
+				"column", conn.Self().Quote(col.Name),
+				"type", nativeType,
+			)
+			colDDLs = append(colDDLs, colDDL)
+		}
+
+	}
+
+	ddl := g.R(
+		conn.GetTemplateValue("core.alter_columns"),
+		"table", table.FullName(),
+		"col_ddl", strings.Join(colDDLs, ", "),
+	)
+	_, err := conn.Exec(ddl)
+	if err != nil {
+		return false, g.Error(err, "could not alter columns on table "+table.FullName())
+	}
+
+	return true, nil
+}
+
+type SchemaMigratorConfig struct {
+	SourceConn  Connection
+	TargetConn  Connection
+	Sourcetable Table
+	TargetTable Table
+}
+
+type SchemaMigrator interface {
+	Apply() error
+	SortStreams([]string) ([]string, bool, map[string][]string, error)
+	GetExtendedColumnMetadata(Connection, Table, iop.Columns) (iop.Columns, error)
+	GetAutoIncrementSyntax(Connection, iop.Column) string
+	TranslateDefaultFromGeneral(Connection, string, iop.ColumnType) string
+	HasPrimaryKeyEnabled() bool
+	HasForeignKeyEnabled() bool
+	HasAutoIncrementEnabled() bool
+	HasNullableEnabled() bool
+	HasDefaultValueEnabled() bool
+	HasUniqueEnabled() bool
+	IsEnabled() bool
+}
+
+// dummySchemaMigrator is a no-op implementation of SchemaMigrator
+type dummySchemaMigrator struct{}
+
+func (d *dummySchemaMigrator) Apply() error {
+	return nil
+}
+
+func (d *dummySchemaMigrator) SortStreams(streams []string) (sortedKeys []string, sorted bool, dependsOn map[string][]string, err error) {
+	return streams, false, nil, nil
+}
+
+func (d *dummySchemaMigrator) GetExtendedColumnMetadata(conn Connection, table Table, columns iop.Columns) (iop.Columns, error) {
+	return columns, nil
+}
+
+func (d *dummySchemaMigrator) GetAutoIncrementSyntax(conn Connection, col iop.Column) string {
+	return ""
+}
+
+func (d *dummySchemaMigrator) TranslateDefaultFromGeneral(conn Connection, value string, colType iop.ColumnType) string {
+	return ""
+}
+
+func (d *dummySchemaMigrator) HasPrimaryKeyEnabled() bool {
+	return false
+}
+
+func (d *dummySchemaMigrator) HasForeignKeyEnabled() bool {
+	return false
+}
+
+func (d *dummySchemaMigrator) HasAutoIncrementEnabled() bool {
+	return false
+}
+
+func (d *dummySchemaMigrator) HasNullableEnabled() bool {
+	return false
+}
+
+func (d *dummySchemaMigrator) HasDefaultValueEnabled() bool {
+	return false
+}
+
+func (d *dummySchemaMigrator) HasUniqueEnabled() bool {
+	return false
+}
+
+func (d *dummySchemaMigrator) IsEnabled() bool {
+	return false
+}
+
+var NewSchemaMigrator = func(cfg *SchemaMigratorConfig) SchemaMigrator {
+	return &dummySchemaMigrator{}
+}

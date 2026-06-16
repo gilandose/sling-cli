@@ -1,0 +1,23 @@
+name: Build Dev (Trigger)
+
+on:
+  workflow_dispatch:
+  push:
+    branches-ignore:
+      - main
+    paths-ignore:
+      - '.github/**'
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+        
+      - name: Trigger Dev Build on Specific Branch
+        uses: benc-uk/workflow-dispatch@v1
+        with:
+          token: ${{ secrets.REPO_ACCESS_TOKEN }}
+          repo: slingdata-io/sling
+          workflow: .github/workflows/build-dev.yml
+          ref: ${{ github.ref }}
+          inputs: '{"backend": "true", "deploy": "false"}'

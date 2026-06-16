@@ -1,0 +1,50 @@
+package core
+
+import (
+	"os"
+	"runtime"
+	"strings"
+	"time"
+
+	"github.com/flarco/g"
+	"github.com/spf13/cast"
+)
+
+// Version is the version number
+var Version = "dev"
+
+var TelProps = g.M(
+	"application", "sling-cli",
+	"version", Version,
+	"os", runtime.GOOS+"/"+runtime.GOARCH,
+)
+
+func init() {
+	// dev build version is in format => 1.2.2.dev/2024-08-20
+	parts := strings.Split(Version, "/")
+	if len(parts) != 2 || os.Getenv("SLING_AGENT_ID") != "" || os.Getenv("SLING_AGENT_KEY") != "" || os.Getenv("SLING_RUNNER_ID") != "" || os.Getenv("SLING_RUNNER_KEY") != "" {
+		return
+	}
+
+	// check expiration date for dev build (30 day window)
+	if date := cast.ToTime(parts[1]); !date.IsZero() && date.Add(30*24*time.Hour).Before(time.Now()) {
+		g.Warn("Sling dev build (%s) has expired! Please download the latest version at https://slingdata.io", parts[0])
+	}
+
+	// update version string
+	Version = g.F("%s (%s)", parts[0], parts[1])
+
+	// Disable AWS IMDS completely to avoid WRN messages
+	if os.Getenv("AWS_EC2_METADATA_DISABLED") == "" {
+		os.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+	}
+}
+
+func VersionSlash() string {
+	// convert to slash version for dev if applicable
+	parts := strings.Split(strings.TrimSuffix(Version, ")"), " (")
+	if len(parts) != 2 {
+		return Version
+	}
+	return parts[0] + "/" + parts[1]
+}

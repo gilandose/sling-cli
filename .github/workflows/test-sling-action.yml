@@ -1,0 +1,27 @@
+name: Test Sling Action
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [test-sling-action]
+
+jobs:
+  test-sling-action:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      LOCAL: LOCAL
+      SQLITE: sqlite:///tmp/test.db
+
+    steps:
+      - uses: actions/checkout@v2
+        
+      - name: List Connections
+        uses: slingdata-io/sling-action@v1
+        with:
+          command: conns list
+        
+      - name: Run Replication
+        uses: slingdata-io/sling-action@v1
+        with:
+          command: run -r tests/replications/r.00.yaml

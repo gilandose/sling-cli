@@ -1,0 +1,79 @@
+steps:
+  - type: log
+    message: '{runtime_state}'
+
+  - type: group
+    id: group1
+    steps:
+      - type: log
+        message: 'Hello from group 1'
+
+  - type: group
+    id: group2
+    loop: [11, 22, 33]
+    steps:
+      - type: log
+        message: 'Hello from group 2: {runtime_state}'
+
+      - type: log
+        message: 'value: {loop.value} ({loop.index})'
+      
+
+  - type: copy
+    id: s3_sftp_copy
+    from: aws_s3/sling_test/files/test1k_s3.csv
+    to: sftp//tmp/test1k_s3.csv
+
+  - type: list
+    id: s3_list
+    location: aws_s3/sling_test/files/
+    recursive: true
+    only: files
+
+  - type: group
+    id: group3
+    loop: state.s3_list.result
+    steps:
+      - type: log
+        message: 'state.s3_list => file: ({loop.index}) {loop.value.location}'
+      
+      - type: copy
+        id: copy_s3_azure
+        from: '{loop.value.location}'
+        to: azure_storage/sftp-test/{loop.value.name}
+
+      - type: log
+        message: '  state.copy_s3_azure.bytes_written => bytes_written: {state.copy_s3_azure.bytes_written}'
+        level: warn
+
+  - type: list
+    id: sftp_list
+    location: sftp//tmp/*.csv
+    only: files
+
+  - type: delete
+    location: azure_storage/sftp-test/
+
+  - type: group
+    loop: state.sftp_list.result
+    steps:
+      - type: log
+        message: 'state.sftp_list => file: ({loop.index}) {loop.value.location}'
+      
+      - type: copy
+        from: '{loop.value.location}'
+        to: azure_storage/sftp-test/{loop.value.name}
+        id: copy_sftp_azure
+
+      - type: log
+        message: '   state.copy_sftp_azure.bytes_written: {state.copy_sftp_azure.bytes_written}'
+        level: warn
+
+  - type: log
+    message: 'group3.my_copy.bytes_written: {state.my_copy.bytes_written}'
+    level: warn
+
+  # - type: log
+  #   message: '{runtime_state}'
+  #   level: warn
+  

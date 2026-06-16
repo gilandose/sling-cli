@@ -1,0 +1,164 @@
+# Sling Test justfile
+# Run `just` or `just help` to see available recipes
+
+set shell := ["bash", "-lc"]
+
+hello:
+    infisical-load dev /dbio
+    echo $D1
+
+# Build the sling binary
+build:
+    #!/usr/bin/env bash
+    set -e
+    echo "Building sling binary..."
+    cd cmd/sling && rm -f sling && go build . && cd -
+    echo "✓ Build complete"
+
+# Test CLI
+test-cli arg1="": build
+    #!/usr/bin/env bash
+    echo "TESTING CLI {{arg1}}"
+    export SLING_BINARY="$PWD/cmd/sling/sling"
+    export RUN_ALL=true
+    bash scripts/test.cli.sh "{{arg1}}"
+
+# Test replication defaults
+test-replication-defaults:
+    #!/usr/bin/env bash
+    echo "TESTING replication defaults"
+    cd cmd/sling && go test -v -run 'TestReplicationDefaults' && cd -
+
+# Test file connections
+test-connections-file arg1="TestSuiteFile" arg2="" arg3="":
+    #!/usr/bin/env bash
+    echo "TESTING file connections {{arg1}} {{arg2}}"
+    cd cmd/sling && go test -v -parallel 3 -run "{{arg1}}" -- "{{arg2}}" "{{arg3}}" && cd -
+
+# Test database connections
+test-connections-database arg1="TestSuiteDatabase" arg2="" arg3="":
+    #!/usr/bin/env bash
+    echo "TESTING database connections {{arg1}} {{arg2}}"
+    cd cmd/sling && RUN_ALL=TRUE go test -v -parallel 4 -timeout 35m -run "{{arg1}}" -- "{{arg2}}" "{{arg3}}" && cd -
+
+# Test core (sling core functionality)
+test-core:
+    #!/usr/bin/env bash
+    echo "TESTING core sling functionality"
+    cd core/sling && go test -v -run 'TestTransformMsUUID' && cd -
+    cd core/sling && go test -v -run 'TestReplication' && cd -
+    cd core/sling && go test -v -run 'TestColumnCasing' && cd -
+    cd core/sling && go test -run 'TestCheck' && cd -
+
+# Test all connections (file + database)
+test-connections: test-replication-defaults test-connections-file test-connections-database
+
+# Test dbio connection
+test-dbio-connection:
+    #!/usr/bin/env bash
+    echo "TESTING dbio connection"
+    cd core/dbio/connection && go test -v -run 'TestConnection' && cd -
+
+# Test dbio iop (input/output processing)
+test-dbio-iop:
+    echo "TESTING dbio iop"
+    infisical-load dev /dbio && cd core/dbio/iop && go test -timeout 5m -v -run 'TestParseDate|TestDetectDelimiter|TestFIX|TestConstraints|TestDuckDb|TestParquetDuckDb|TestIcebergReader|TestDeltaReader|TestPartition|TestExtractPartitionTimeValue|TestGetLowestPartTimeUnit|TestMatchedPartitionMask|TestGeneratePartURIsFromRange|TestDataset|TestValidateNames|TestExcelDateToTime|TestBinaryToHex|TestBinaryToDecimal|TestArrow|TestFunctions|TestQueue|TestEvaluator|TestTransforms|TestColumnTyping' && cd -
+
+# Test dbio database
+test-dbio-database:
+    #!/usr/bin/env bash
+    echo "TESTING dbio database"
+    cd core/dbio/database && go test -v -run 'TestParseTableName|TestRegexMatch|TestParseColumnName|TestParseSQLMultiStatements|TestTrimSQLComments|TestAddPrimaryKeyToDDL' && cd -
+    cd core/dbio/database && go test -run TestChunkByColumnRange && cd -
+
+# Test dbio filesys
+test-dbio-filesys:
+    echo "TESTING dbio filesys"
+    infisical-load dev /dbio && cd core/dbio/filesys && go test -v -run 'TestFileSysLocalCsv|TestFileSysLocalJson|TestFileSysLocalParquet|TestFileSysLocalFormat|TestFileSysGoogle|TestFileSysGoogleDrive|TestFileSysS3|TestFileSysAzure|TestFileSysSftp|TestFileSysFtp|TestExcel|TestFileSysLocalIceberg|TestFileSysLocalDelta' && cd -
+
+# Test dbio api
+test-dbio-api:
+    #!/usr/bin/env bash
+    echo "TESTING dbio api"
+    cd core/dbio/api && go test -v && cd -
+
+# Test all dbio
+test-dbio: test-dbio-connection test-dbio-iop test-dbio-database test-dbio-api # test-dbio-filesys
+
+# Test Python (default, without ARROW)
+test-python-main:
+    #!/usr/bin/env bash
+    echo "TESTING Python"
+    export SLING_BINARY="$PWD/cmd/sling/sling"
+    cd ../sling-python/sling && uv sync --group test && uv run python -m pytest tests/tests.py -v && cd -
+    cd ../sling-python/sling && uv run python -m pytest tests/test_api_spec.py -v && cd -
+
+# Test Python class without ARROW
+test-python-arrow-false:
+    #!/usr/bin/env bash
+    echo "TESTING Python class (ARROW=false)"
+    export SLING_BINARY="$PWD/cmd/sling/sling"
+    cd ../sling-python/sling && uv sync --group test && SLING_USE_ARROW=false uv run python -m pytest tests/test_sling_class.py -v && cd -
+
+# Test Python class with ARROW
+test-python-arrow-true:
+    #!/usr/bin/env bash
+    echo "TESTING Python class (ARROW=true)"
+    export SLING_BINARY="$PWD/cmd/sling/sling"
+    cd ../sling-python/sling && uv sync --group test && SLING_USE_ARROW=true uv run python -m pytest tests/test_sling_class.py -v && cd -
+
+# Test Python Connection class (sling conns exec/test, arrow IPC, CSV streaming, limit)
+test-python-conns:
+    #!/usr/bin/env bash
+    echo "TESTING Python Connection class"
+    export SLING_BINARY="$PWD/cmd/sling/sling"
+    cd ../sling-python/sling && uv sync --group test && uv run python -m pytest tests/test_connection.py -v && cd -
+
+# Run all Python tests
+test-python: test-python-main test-python-arrow-false test-python-arrow-true test-python-conns
+
+test-cdc-basic:
+    #!/usr/bin/env bash
+    cd ../sling && bash scripts/test.cdc.sh basic && cd -
+
+test-cdc-soft-delete:
+    #!/usr/bin/env bash
+    cd ../sling && bash scripts/test.cdc.sh soft_delete && cd -
+
+test-cdc-soft-replay:
+    #!/usr/bin/env bash
+    cd ../sling && bash scripts/test.cdc.sh replay && cd -
+
+test-cdc-soft-sustained:
+    #!/usr/bin/env bash
+    cd ../sling && bash scripts/test.cdc.sh sustained && cd -
+
+# Run all CDC test
+test-cdc: test-cdc-basic test-cdc-soft-delete test-cdc-soft-replay
+
+# Run all tests
+test-all: test-cli test-connections test-dbio test-core test-python test-cdc
+    #!/usr/bin/env bash
+    echo "✓ All tests passed!"
+
+test-dbio-core-python: test-dbio test-core test-python
+    #!/usr/bin/env bash
+    echo "✓ All tests passed!"
+
+# Test ADBC DuckDB via Docker (auto-detects host arch, skips cross-arch)
+# Usage: just test-adbc-docker [amd64|arm64|amd64,arm64]
+test-adbc-docker arch="amd64,arm64":
+    #!/usr/bin/env bash
+    set -e
+    echo "TESTING ADBC DuckDB via Docker ({{arch}})"
+    bash tests/pipelines/adbc/duckdb/run_docker_test.sh "{{arch}}"
+
+# Clean build artifacts
+clean:
+    #!/usr/bin/env bash
+    echo "Cleaning build artifacts..."
+    rm -f cmd/sling/sling
+    cd ../sling-python/sling && find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true && cd -
+    cd core/dbio && rm -f .test 2>/dev/null || true && cd -
+    echo "✓ Clean complete"
+

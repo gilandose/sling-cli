@@ -1,0 +1,785 @@
+core:
+  create_table: create table {table} ({col_types}) {dist_key} {sort_key}
+  drop_table: drop table if exists {table}
+  drop_view: drop view if exists {view}
+  drop_index: "select 'indexes do not apply for redshift'"
+  create_index: "select 'indexes do not apply for redshift'"
+  replace: insert into {table} ({fields}) values ({values}) on conflict ({pk_fields}) do update set {set_fields}
+  replace_temp: |
+    insert into {table} ({names})
+    select {names} from {temp_table}
+    on conflict ({pk_fields}) do nothing;
+    update {table} as t1 set {set_fields2}
+    from (select * from {temp_table}) as t2
+    where {pk_fields_equal}
+  insert_ignore: insert into {table} ({fields}) values ({values}) on conflict ({pk_fields}) do nothing
+  insert_ignore_temp: insert into {table} ({names}) select {names} from {temp_table} on conflict ({pk_fields}) do nothing
+  update_temp: |
+    update {table} as t1 set {set_fields2}
+    from (select * from {temp_table}) as t2
+    where {pk_fields_equal2}
+  sample: select {fields} from {table} TABLESAMPLE SYSTEM (50) limit {n}
+  rename_table: ALTER TABLE {table} RENAME TO {new_table}
+  set_schema: ALTER TABLE {table} SET SCHEMA {new_schema}
+  
+  # TODO: need to drop the table and recreate it
+  # optimize_column: |
+  #   alter table {table} rename to {table_old};
+  #   create table {table} ( {col_ddl} );
+  #   insert into {table} ({fields})
+  #   select {cols}
+  #   from {table_old};
+  #   drop table {table_old};
+  
+  copy_from_s3: |
+    COPY {tgt_table} ({tgt_columns})
+    from '{s3_path}'
+    {credential_expr}
+    CSV delimiter ',' EMPTYASNULL BLANKSASNULL GZIP IGNOREHEADER 1 DATEFORMAT 'auto' TIMEFORMAT 'auto'
+  copy_to_s3: |
+    unload ('{sql}')   
+    to '{s3_path}'
+    {credential_expr}
+    allowoverwrite {format_options} PARALLEL {parallel}
+  alter_columns: |
+    alter table {table} {col_ddl}
+  stl_load_errors_check: select colname, line_number, err_reason  from stl_load_errors order by starttime desc limit 1
+
+  # Redshift only supports insert and delete_insert (no native MERGE support)
+  merge_insert: |
+    INSERT INTO {tgt_table} ({insert_fields})
+    SELECT {src_fields} FROM {src_table} src
+    WHERE NOT EXISTS (
+      SELECT 1 FROM {tgt_table} tgt WHERE {src_tgt_pk_equal}
+    )
+
+  merge_delete_insert: |
+    DELETE FROM {tgt_table} tgt
+    WHERE EXISTS (
+      SELECT 1 FROM {src_table} src
+      WHERE {src_tgt_pk_equal}
+    );
+    INSERT INTO {tgt_table} ({insert_fields})
+    SELECT {src_fields} FROM {src_table} src
+
+  # Redshift does not support UPDATE or UPDATE_INSERT (no native MERGE statement)
+  merge_update: null
+  merge_update_insert: null
+
+  merge_change_capture: |
+    DELETE FROM {tgt_table} tgt
+    WHERE EXISTS (
+      SELECT 1 FROM (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
+        FROM {src_table}
+      ) src
+      WHERE src._rn = 1
+      AND {src_tgt_pk_equal}
+    );
+    INSERT INTO {tgt_table} ({insert_fields})
+    SELECT {src_fields} FROM (
+      SELECT *, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
+      FROM {src_table}
+      WHERE _sling_synced_op != 'D'
+    ) src WHERE _rn = 1
+    AND ({pk_fields}) NOT IN (
+      SELECT {pk_fields} FROM (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
+        FROM {src_table}
+      ) del WHERE _rn = 1 AND _sling_synced_op = 'D'
+    )
+
+  merge_change_capture_soft: |
+    UPDATE {tgt_table} tgt SET _sling_synced_at = CURRENT_TIMESTAMP, _sling_synced_op = 'D'
+    WHERE _sling_synced_op != 'D'
+    AND EXISTS (
+      SELECT 1 FROM (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
+        FROM {src_table}
+      ) src
+      WHERE src._rn = 1 AND src._sling_synced_op = 'D'
+      AND {src_tgt_pk_equal}
+    );
+    DELETE FROM {tgt_table} tgt
+    WHERE EXISTS (
+      SELECT 1 FROM (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
+        FROM {src_table}
+        WHERE _sling_synced_op != 'D'
+      ) src
+      WHERE src._rn = 1
+      AND {src_tgt_pk_equal}
+    );
+    INSERT INTO {tgt_table} ({insert_fields})
+    SELECT {src_fields} FROM (
+      SELECT *, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
+      FROM {src_table}
+      WHERE _sling_synced_op != 'D'
+    ) src WHERE _rn = 1
+    AND ({pk_fields}) NOT IN (
+      SELECT {pk_fields} FROM (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
+        FROM {src_table}
+      ) del WHERE _rn = 1 AND _sling_synced_op = 'D'
+    )
+
+  # Foreign key DDL template (Redshift supports declarative FKs - not enforced by default)
+  add_foreign_key: |
+    ALTER TABLE {table} ADD CONSTRAINT {constraint} FOREIGN KEY ({column}) REFERENCES {ref_table}({ref_column}){on_delete}{on_update}
+
+  # Column comment/description template
+  add_column_comment: COMMENT ON COLUMN {table}."{column}" IS {comment}
+
+  # Table comment/description template
+  add_table_comment: COMMENT ON TABLE {table} IS {comment}
+
+metadata:
+
+  current_database:
+    select current_database()
+    
+  databases: |
+    select datname as name from pg_database
+    
+  schemas: |
+    select s.nspname as schema_name
+    from pg_catalog.pg_namespace s
+    where s.nspname not like 'pg_temp_%'
+    order by s.nspname
+    
+  tables: |
+    select table_schema as schema_name, table_name, 'false' as is_view
+    from information_schema.tables
+    where table_type = 'BASE TABLE'
+      {{if .schema -}} and table_schema = '{schema}' {{- end}}
+    order by table_schema, table_name
+    
+  views: |
+    select table_schema as schema_name, table_name, 'true' as is_view
+    from information_schema.tables
+    where table_type = 'VIEW'
+      {{if .schema -}} and table_schema = '{schema}' {{- end}}
+    order by table_schema, table_name
+
+  columns: |
+    select column_name, data_type
+    from information_schema.columns
+    where table_schema = '{schema}'
+      and table_name = '{table}'
+    order by ordinal_position
+
+  primary_keys: |
+    select tco.constraint_name as pk_name,
+           kcu.ordinal_position as position,
+           kcu.column_name as column_name
+    from information_schema.table_constraints tco
+    join information_schema.key_column_usage kcu 
+         on kcu.constraint_name = tco.constraint_name
+         and kcu.constraint_schema = tco.constraint_schema
+         and kcu.constraint_name = tco.constraint_name
+    where kcu.table_schema = '{schema}'
+      and kcu.table_name = '{table}'
+    order by kcu.table_schema,
+             kcu.table_name,
+             position
+
+  # Redshift doesn't support traditional indexes (uses SORTKEY/DISTKEY instead)
+  # Return empty result set
+  indexes: |
+    SELECT
+      NULL::text AS index_name,
+      NULL::text AS column_name
+    WHERE FALSE     
+  
+  columns_full: |
+    with tables as (
+      select
+        table_catalog,
+        table_schema,
+        table_name,
+        case table_type
+          when 'VIEW' then true
+          else false
+        end as is_view
+      from information_schema.tables
+      where table_schema = '{schema}' and table_name = '{table}'
+    )
+    select
+      cols.table_schema as schema_name,
+      cols.table_name as table_name,
+      cols.column_name as column_name,
+      cols.data_type as data_type,
+      cols.ordinal_position as position
+    from information_schema.columns cols
+    join tables
+      on tables.table_catalog = cols.table_catalog
+      and tables.table_schema = cols.table_schema
+      and tables.table_name = cols.table_name
+    order by cols.table_catalog, cols.table_schema, cols.table_name, cols.ordinal_position
+
+  schemata: |
+    with tables as (
+      select
+        table_catalog,
+        table_schema,
+        table_name,
+        case table_type
+          when 'VIEW' then true
+          else false
+        end as is_view
+      from information_schema.tables
+      where 1=1
+        {{if .schema -}} and table_schema = '{schema}' {{- end}}
+        {{if .tables -}} and table_name in ({tables}) {{- end}}
+    )
+    select
+      cols.table_schema as schema_name,
+      cols.table_name as table_name,
+      tables.is_view as is_view,
+      cols.column_name as column_name,
+      cols.data_type as data_type,
+      cols.ordinal_position as position
+    from information_schema.columns cols
+    join tables
+      on tables.table_catalog = cols.table_catalog
+      and tables.table_schema = cols.table_schema
+      and tables.table_name = cols.table_name
+    order by cols.table_catalog, cols.table_schema, cols.table_name, cols.ordinal_position
+  
+  ddl_table: |
+      SELECT
+        ddl
+        FROM
+        (
+        SELECT
+          table_id
+          ,schemaname
+          ,tablename
+          ,seq
+          ,ddl
+        FROM
+          (
+          --DROP TABLE
+          SELECT
+          c.oid::bigint as table_id
+          ,n.nspname AS schemaname
+          ,c.relname AS tablename
+          ,0 AS seq
+          ,'--DROP TABLE ' + QUOTE_IDENT(n.nspname) + '.' + QUOTE_IDENT(c.relname) + ';' AS ddl
+          from pg_namespace AS n
+          INNER JOIN pg_class AS c ON n.oid = c.relnamespace
+          where c.relkind = 'r'
+          --CREATE TABLE
+          UNION SELECT
+          c.oid::bigint as table_id
+          ,n.nspname AS schemaname
+          ,c.relname AS tablename
+          ,2 AS seq
+          ,'CREATE TABLE IF NOT EXISTS ' + QUOTE_IDENT(n.nspname) + '.' + QUOTE_IDENT(c.relname) + '' AS ddl
+          from pg_namespace AS n
+          INNER JOIN pg_class AS c ON n.oid = c.relnamespace
+          where c.relkind = 'r'
+          --OPEN PAREN COLUMN LIST
+          UNION select c.oid::bigint as table_id,n.nspname AS schemaname, c.relname AS tablename, 5 AS seq, '(' AS ddl
+          from pg_namespace AS n
+          INNER JOIN pg_class AS c ON n.oid = c.relnamespace
+          where c.relkind = 'r'
+          --COLUMN LIST
+          UNION SELECT
+          table_id
+          ,schemaname
+          ,tablename
+          ,seq
+          ,'\t' + col_delim + col_name + ' ' + col_datatype + ' ' + col_nullable + ' ' + col_default + ' ' + col_encoding AS ddl
+          FROM
+          (
+          SELECT
+            c.oid::bigint as table_id
+          ,n.nspname AS schemaname
+            ,c.relname AS tablename
+            ,100000000 + a.attnum AS seq
+            ,CASE WHEN a.attnum > 1 THEN ',' ELSE '' END AS col_delim
+            ,QUOTE_IDENT(a.attname) AS col_name
+            ,CASE WHEN STRPOS(UPPER(format_type(a.atttypid, a.atttypmod)), 'CHARACTER VARYING') > 0
+              THEN REPLACE(UPPER(format_type(a.atttypid, a.atttypmod)), 'CHARACTER VARYING', 'VARCHAR')
+            WHEN STRPOS(UPPER(format_type(a.atttypid, a.atttypmod)), 'CHARACTER') > 0
+              THEN REPLACE(UPPER(format_type(a.atttypid, a.atttypmod)), 'CHARACTER', 'CHAR')
+            ELSE UPPER(format_type(a.atttypid, a.atttypmod))
+            END AS col_datatype
+            ,CASE WHEN format_encoding((a.attencodingtype)::integer) = 'none'
+            THEN 'ENCODE RAW'
+            ELSE 'ENCODE ' + format_encoding((a.attencodingtype)::integer)
+            END AS col_encoding
+            ,CASE WHEN a.atthasdef IS TRUE THEN 'DEFAULT ' + adef.adsrc ELSE '' END AS col_default
+            ,CASE WHEN a.attnotnull IS TRUE THEN 'NOT NULL' ELSE '' END AS col_nullable
+          from pg_namespace AS n
+          INNER JOIN pg_class AS c ON n.oid = c.relnamespace
+          INNER JOIN pg_attribute AS a ON c.oid = a.attrelid
+          LEFT OUTER JOIN pg_attrdef AS adef ON a.attrelid = adef.adrelid AND a.attnum = adef.adnum
+          where c.relkind = 'r'
+            AND a.attnum > 0
+          ORDER BY a.attnum
+          )
+          --CONSTRAINT LIST
+          UNION (SELECT
+          c.oid::bigint as table_id
+          ,n.nspname AS schemaname
+          ,c.relname AS tablename
+          ,200000000 + CAST(con.oid AS INT) AS seq
+          ,'\t,' + pg_get_constraintdef(con.oid) AS ddl
+          from pg_constraint AS con
+          INNER JOIN pg_class AS c ON c.relnamespace = con.connamespace AND c.oid = con.conrelid
+          INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
+          where c.relkind = 'r' AND pg_get_constraintdef(con.oid) NOT LIKE 'FOREIGN KEY%'
+          ORDER BY seq)
+          --CLOSE PAREN COLUMN LIST
+          UNION select c.oid::bigint as table_id,n.nspname AS schemaname, c.relname AS tablename, 299999999 AS seq, ')' AS ddl
+          from pg_namespace AS n
+          INNER JOIN pg_class AS c ON n.oid = c.relnamespace
+          where c.relkind = 'r'
+          --BACKUP
+          UNION SELECT
+          c.oid::bigint as table_id
+          ,n.nspname AS schemaname
+          ,c.relname AS tablename
+          ,300000000 AS seq
+          ,'BACKUP NO' as ddl
+        from pg_namespace AS n
+          INNER JOIN pg_class AS c ON n.oid = c.relnamespace
+          INNER JOIN (SELECT
+            SPLIT_PART(key,'_',5) id
+            from pg_conf
+            where key LIKE 'pg_class_backup_%'
+            AND SPLIT_PART(key,'_',4) = (SELECT
+              oid
+              from pg_database
+              where datname = current_database())) t ON t.id=c.oid
+          where c.relkind = 'r'
+          --BACKUP WARNING
+          UNION SELECT
+          c.oid::bigint as table_id
+          ,n.nspname AS schemaname
+          ,c.relname AS tablename
+          ,1 AS seq
+          ,'--WARNING: This DDL inherited the BACKUP NO property from the source table' as ddl
+        from pg_namespace AS n
+          INNER JOIN pg_class AS c ON n.oid = c.relnamespace
+          INNER JOIN (SELECT
+            SPLIT_PART(key,'_',5) id
+            from pg_conf
+            where key LIKE 'pg_class_backup_%'
+            AND SPLIT_PART(key,'_',4) = (SELECT
+              oid
+              from pg_database
+              where datname = current_database())) t ON t.id=c.oid
+          where c.relkind = 'r'
+          --DISTSTYLE
+          UNION SELECT
+          c.oid::bigint as table_id
+          ,n.nspname AS schemaname
+          ,c.relname AS tablename
+          ,300000001 AS seq
+          ,CASE WHEN c.reldiststyle = 0 THEN 'DISTSTYLE EVEN'
+            WHEN c.reldiststyle = 1 THEN 'DISTSTYLE KEY'
+            WHEN c.reldiststyle = 8 THEN 'DISTSTYLE ALL'
+            WHEN c.reldiststyle = 9 THEN 'DISTSTYLE AUTO'
+            ELSE '<<Error - UNKNOWN DISTSTYLE>>'
+            END AS ddl
+          from pg_namespace AS n
+          INNER JOIN pg_class AS c ON n.oid = c.relnamespace
+          where c.relkind = 'r'
+          --DISTKEY COLUMNS
+          UNION SELECT
+          c.oid::bigint as table_id
+          ,n.nspname AS schemaname
+          ,c.relname AS tablename
+          ,400000000 + a.attnum AS seq
+          ,' DISTKEY (' + QUOTE_IDENT(a.attname) + ')' AS ddl
+          from pg_namespace AS n
+          INNER JOIN pg_class AS c ON n.oid = c.relnamespace
+          INNER JOIN pg_attribute AS a ON c.oid = a.attrelid
+          where c.relkind = 'r'
+            AND a.attisdistkey IS TRUE
+            AND a.attnum > 0
+          --SORTKEY COLUMNS
+          UNION select table_id,schemaname, tablename, seq,
+              case when min_sort <0 then 'INTERLEAVED SORTKEY (' else ' SORTKEY (' end as ddl
+        from (SELECT
+          c.oid::bigint as table_id
+          ,n.nspname AS schemaname
+          ,c.relname AS tablename
+          ,499999999 AS seq
+          ,min(attsortkeyord) min_sort from pg_namespace AS n
+          INNER JOIN  pg_class AS c ON n.oid = c.relnamespace
+          INNER JOIN pg_attribute AS a ON c.oid = a.attrelid
+          where c.relkind = 'r'
+          AND abs(a.attsortkeyord) > 0
+          AND a.attnum > 0
+          group by 1,2,3,4 )
+          UNION (SELECT
+          c.oid::bigint as table_id
+          ,n.nspname AS schemaname
+          ,c.relname AS tablename
+          ,500000000 + abs(a.attsortkeyord) AS seq
+          ,CASE WHEN abs(a.attsortkeyord) = 1
+            THEN '\t' + QUOTE_IDENT(a.attname)
+            ELSE '\t, ' + QUOTE_IDENT(a.attname)
+            END AS ddl
+          from  pg_namespace AS n
+          INNER JOIN pg_class AS c ON n.oid = c.relnamespace
+          INNER JOIN pg_attribute AS a ON c.oid = a.attrelid
+          where c.relkind = 'r'
+            AND abs(a.attsortkeyord) > 0
+            AND a.attnum > 0
+          ORDER BY abs(a.attsortkeyord))
+          UNION SELECT
+          c.oid::bigint as table_id
+          ,n.nspname AS schemaname
+          ,c.relname AS tablename
+          ,599999999 AS seq
+          ,'\t)' AS ddl
+          from pg_namespace AS n
+          INNER JOIN  pg_class AS c ON n.oid = c.relnamespace
+          INNER JOIN  pg_attribute AS a ON c.oid = a.attrelid
+          where c.relkind = 'r'
+            AND abs(a.attsortkeyord) > 0
+            AND a.attnum > 0
+          --END SEMICOLON
+          UNION select c.oid::bigint as table_id ,n.nspname AS schemaname, c.relname AS tablename, 600000000 AS seq, ';' AS ddl
+          from  pg_namespace AS n
+          INNER JOIN pg_class AS c ON n.oid = c.relnamespace
+          where c.relkind = 'r' 
+          --COMMENT
+          UNION
+          select c.oid::bigint AS table_id,
+              n.nspname     AS schemaname,
+              c.relname     AS tablename,
+              600250000     AS seq,
+              ('COMMENT ON '::text + nvl2(cl.column_name, 'column '::text, 'table '::text) + quote_ident(n.nspname::text) + '.'::text + quote_ident(c.relname::text) + nvl2(cl.column_name, '.'::text + cl.column_name::text, ''::text) + ' IS \''::text + quote_ident(des.description) + '\'; '::text)::character VARYING AS ddl
+          from pg_description des
+          JOIN pg_class c ON c.oid = des.objoid
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+          LEFT JOIN information_schema."columns" cl
+          ON cl.ordinal_position::integer = des.objsubid AND cl.table_name::NAME = c.relname
+          where c.relkind = 'r'
+
+          UNION
+          --TABLE OWNERSHIP AS AN ALTER TABLE STATMENT
+          select c.oid::bigint as table_id ,n.nspname AS schemaname, c.relname AS tablename, 600500000 AS seq, 
+          'ALTER TABLE ' + QUOTE_IDENT(n.nspname) + '.' + QUOTE_IDENT(c.relname) + ' owner to '+  QUOTE_IDENT(u.usename) +';' AS ddl
+          from  pg_namespace AS n
+          INNER JOIN pg_class AS c ON n.oid = c.relnamespace
+          INNER JOIN pg_user AS u ON c.relowner = u.usesysid
+          where c.relkind = 'r'
+          
+          )
+          UNION (
+            select c.oid::bigint as table_id,'zzzzzzzz' || n.nspname AS schemaname,
+              'zzzzzzzz' || c.relname AS tablename,
+              700000000 + CAST(con.oid AS INT) AS seq,
+              'ALTER TABLE ' + QUOTE_IDENT(n.nspname) + '.' + QUOTE_IDENT(c.relname) + ' ADD ' + pg_get_constraintdef(con.oid)::VARCHAR(1024) + ';' AS ddl
+            from pg_constraint AS con
+              INNER JOIN pg_class AS c
+                    ON c.relnamespace = con.connamespace
+                    AND c.oid = con.conrelid
+              INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
+            where c.relkind = 'r'
+            AND con.contype = 'f'
+            ORDER BY seq
+          )
+        ORDER BY table_id,schemaname, tablename, seq
+        )
+        where schemaname = '{schema}'
+        and tablename = '{table}'
+    
+  ddl_view: |
+    select pg_get_viewdef('"{schema}"."{table}"')::text as ddl
+
+  # Extended column attributes for schema migration
+  # Uses pg_attribute.attidentity to detect identity columns ('a' = ALWAYS, 'd' = BY DEFAULT)
+  columns_extended: |
+    SELECT
+      c.column_name,
+      CASE WHEN c.is_nullable = 'YES' THEN 'true' ELSE 'false' END AS is_nullable,
+      c.column_default AS default_value,
+      CASE WHEN a.attidentity IN ('a', 'd') THEN 'true' ELSE 'false' END AS is_auto_increment,
+      CASE WHEN a.attidentity IN ('a', 'd') THEN '1' ELSE NULL END AS identity_seed,
+      CASE WHEN a.attidentity IN ('a', 'd') THEN '1' ELSE NULL END AS identity_increment,
+      CASE WHEN pk.column_name IS NOT NULL THEN 'true' ELSE 'false' END AS is_primary_key,
+      d.description
+    FROM information_schema.columns c
+    JOIN pg_catalog.pg_class t ON t.relname = c.table_name
+    JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace AND n.nspname = c.table_schema
+    JOIN pg_catalog.pg_attribute a ON a.attrelid = t.oid AND a.attname = c.column_name AND a.attnum > 0
+    LEFT JOIN (
+      SELECT kcu.column_name
+      FROM information_schema.table_constraints tc
+      JOIN information_schema.key_column_usage kcu
+        ON tc.constraint_name = kcu.constraint_name
+        AND tc.table_schema = kcu.table_schema
+      WHERE tc.constraint_type = 'PRIMARY KEY'
+        AND tc.table_schema = '{schema}'
+        AND tc.table_name = '{table}'
+    ) pk ON pk.column_name = c.column_name
+    LEFT JOIN pg_catalog.pg_description d ON d.objoid = t.oid
+      AND d.objsubid = c.ordinal_position
+    WHERE c.table_schema = '{schema}' AND c.table_name = '{table}'
+    ORDER BY c.ordinal_position
+
+  # Foreign key relationships
+  foreign_keys: |
+    SELECT
+      tc.constraint_name,
+      kcu.column_name,
+      ccu.table_schema AS referenced_schema,
+      ccu.table_name AS referenced_table,
+      ccu.column_name AS referenced_column,
+      rc.delete_rule AS on_delete,
+      rc.update_rule AS on_update
+    FROM information_schema.table_constraints tc
+    JOIN information_schema.key_column_usage kcu
+      ON tc.constraint_name = kcu.constraint_name
+      AND tc.table_schema = kcu.table_schema
+    JOIN information_schema.constraint_column_usage ccu
+      ON ccu.constraint_name = tc.constraint_name
+      AND ccu.table_schema = tc.table_schema
+    JOIN information_schema.referential_constraints rc
+      ON rc.constraint_name = tc.constraint_name
+      AND rc.constraint_schema = tc.constraint_schema
+    WHERE tc.constraint_type = 'FOREIGN KEY'
+      AND tc.table_schema = '{schema}'
+      AND tc.table_name = '{table}'
+    ORDER BY tc.constraint_name, kcu.ordinal_position
+
+  # Extended table attributes for schema migration
+  table_extended: |
+    SELECT
+      d.description
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    LEFT JOIN pg_catalog.pg_description d ON d.objoid = c.oid AND d.objsubid = 0
+    WHERE n.nspname = '{schema}' AND c.relname = '{table}'
+
+analysis:
+  field_chars: |
+    select
+      '{schema}' as schema_nm,
+      '{table}' as table_nm,
+      '{field}' as field, sum(case when {field}::text ~ '\n' then 1 else 0 end) as cnt_nline, 
+      sum(case when {field}::text ~ '\t' then 1 else 0 end) as cnt_tab, 
+      sum(case when {field}::text ~ ',' then 1 else 0 end) as cnt_comma, 
+      sum(case when {field}::text ~ '"' then 1 else 0 end) as cnt_dquote, 
+      min(length({field}::text)) as f_min_len, 
+      max(length({field}::text)) as f_max_len
+    from "{schema}"."{table}"
+
+  field_stat_len: |
+    -- field_stat_len {table}
+    select
+      '{schema}' as schema_nm,
+      '{table}' as table_nm,
+      '{field}' as field,
+      count(*) as tot_cnt,
+      min(length({field}::text)) as f_min_len,
+      max(length({field}::text)) as f_max_len
+    from "{schema}"."{table}"
+  
+  field_stat_deep: |
+    select
+      '{schema}' as schema_nm,
+      '{table}' as table_nm,
+      '{field}' as field,
+      count(*) as tot_cnt,
+      count({field}) as f_cnt,
+      count(*) - count({field}) as f_null_cnt,
+      round(100.0 * (count(*) - count({field})) / count(*),1) as f_null_prct,
+      count(distinct {field}) as f_dstct_cnt,
+      round(100.0 * count(distinct {field}) / count(*),1) as f_dstct_prct,
+      count(*) - count(distinct {field}) as f_dup_cnt,
+      min({field})::text as f_min,
+      max({field})::text as f_max,
+      min(length({field}::text)) as f_min_len,
+      max(length({field}::text)) as f_max_len
+    from "{schema}"."{table}"
+
+  distro_field: |
+    with t1 as (
+      select
+        '{field}'::text as field,
+        {field},
+        count(*) cnt
+      from "{schema}"."{table}"
+      group by {field}
+      order by count(*) desc
+    )
+    , t2 as (
+      select
+        '{field}'::text as field,
+        count(*) ttl_cnt
+      from "{schema}"."{table}"
+    )
+    select
+      '{table}' as table_nm,
+      t1.field,
+      {field} as value,
+      cnt,
+      round(100.0 * cnt / ttl_cnt, 2) as prct
+    from t1
+    join t2
+      on t1.field = t2.field
+    order by cnt desc
+
+  distro_field_group: |
+    with t1 as (
+      select
+        '{field}'::text as field,
+        {group_expr} as group_exp,
+        {field},        
+        count(*) cnt
+      from "{schema}"."{table}"
+      group by {field}, {group_expr}
+      order by count(*) desc
+    )
+    , t2 as (
+      select
+        '{field}'::text as field,
+        count(*) ttl_cnt
+      from "{schema}"."{table}"
+    )
+    select
+      '{table}' as table_nm,
+      t1.field,
+      t1.group_exp,
+      {field} as value,
+      cnt,
+      round(100.0 * cnt / ttl_cnt, 2) as prct
+    from t1
+    join t2
+      on t1.field = t2.field
+    order by cnt desc
+
+  distro_field_date: |
+    with t1 as (
+        select
+          '{field}'::text as field,
+          extract(year from {field}) as year,
+          extract(month from {field}) as month,
+          extract(day from {field}) as day,
+          count(*) cnt
+        from "{schema}"."{table}"
+        group by 2, 3, 4
+        order by 2, 3, 4
+      )
+      , t2 as (
+        select '{field}'::text as field, count(*) ttl_cnt
+        from "{schema}"."{table}"
+      )
+      select 
+        '{schema}' as schema_nm,
+        '{table}' as table_nm,
+        t1.field,
+        t1.year,
+        t1.month,
+        t1.day,
+        cnt,
+        round(100.0 * cnt / ttl_cnt, 2) as prct
+      from t1
+      join t2
+        on t1.field = t2.field
+      order by t1.year, t1.month, t1.day
+
+function:
+  truncate_f: trunc({field})
+  truncate_datef: trunc({field})
+  string_type: text
+  cast_to_string: '{field}::text'
+  cast_to_text: '{field}::text'
+  date_to_int: trunc(extract(epoch from {field})/(60*60*24))::int
+  number_to_int: round({field}, 0)
+  checksum_date: date_part('epoch', {field}::timestamp)::bigint
+  checksum_datetime: date_part('epoch', {field}::timestamp)::bigint
+  checksum_string: length({field}::text)
+  checksum_boolean: length(case when {field} = true then 'true' when {field} = false then 'false' end)
+  checksum_json: length(replace({field}::text, ' ', ''))
+  # checksum_datetime: (date_part('epoch', {field}) * 1000000)::bigint
+  now: current_timestamp
+
+variable:
+  # Redshift default is delete_insert since it doesn't support native MERGE
+  default_merge_strategy: delete_insert
+  max_string_type: varchar(65535)
+  max_string_length: 65535
+  max_column_length: 127
+
+native_type_map:
+  bigint: bigint
+  bool: bool
+  boolean: bool
+  bpchar: string
+  bytea: binary
+  char: string
+  character: string
+  "character varying": text
+  date: date
+  decimal: decimal
+  "double precision": float
+  float: float
+  float4: float
+  float8: float
+  int2: smallint
+  int4: integer
+  int8: bigint
+  integer: integer
+  name: string
+  numeric: decimal
+  real: float
+  smallint: smallint
+  text: text
+  timestamp: timestamp
+  "timestamp with time zone": timestampz
+  "timestamp without time zone": timestamp
+  timestamptz: timestampz
+  varchar: text
+
+general_type_map:
+  bigint: bigint
+  binary: "varchar(65535)"
+  bool: bool
+  date: date
+  datetime: timestamp
+  decimal: "decimal(,)"
+  float: "double precision"
+  integer: integer
+  json: "varchar(65535)"
+  smallint: smallint
+  string: "varchar()"
+  text: "varchar(65535)"
+  time: "varchar(65535)"
+  timestamp: timestamp
+  timestampz: timestamptz
+  timez: "varchar(65535)"
+  uuid: "varchar(36)"
+
+# Schema migration: default value translation between native and generalized forms
+default_value_map:
+  to_general:
+    "CURRENT_TIMESTAMP": "current_timestamp"
+    "getdate()": "current_timestamp"
+    "GETDATE()": "current_timestamp"
+    "sysdate": "current_timestamp"
+    "SYSDATE": "current_timestamp"
+    "CURRENT_DATE": "current_date"
+    "current_date": "current_date"
+    "true": "true"
+    "false": "false"
+    "'t'": "true"
+    "'f'": "false"
+  from_general:
+    "current_timestamp": "GETDATE()"
+    "current_timestamp_utc": "SYSDATE"
+    "current_date": "CURRENT_DATE"
+    "current_time": "GETDATE()"
+    "uuid()": "''"
+    "true": "true"
+    "false": "false"
+    "null": "NULL"

@@ -1,0 +1,10 @@
+source: oracle
+target: local
+
+defaults:
+  mode: full-refresh
+
+streams:
+  oracle.TEST1K_ORACLE_WIDE:
+    object: /tmp/test.csv
+    where: '2 > 1'

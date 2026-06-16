@@ -1,0 +1,20 @@
+{
+  "source": {
+    "stream": "testing", 
+    "conn": "testing",
+    "options": {
+      "limit": 111
+    }
+  }, 
+  "target": {
+    "options": {
+      "table_ddl": "testing", 
+      "post_sql": "testing", 
+      "pre_sql": "testing", 
+      "table_tmp": "testing"
+    },
+    "object": "testing", 
+    "conn": "testing"
+  },
+  "mode": "testing"
+}

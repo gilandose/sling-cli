@@ -1,0 +1,13 @@
+source: '{source}'
+target: SQLITE
+
+defaults:
+  mode: full-refresh
+
+streams:
+  file://./cmd/sling/{folder}/files/test1.1.csv:
+    object: 'main.test'
+
+env:
+  folder: tests
+  source: LOCAL

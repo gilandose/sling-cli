@@ -1,0 +1,332 @@
+package filesys
+
+import (
+	"context"
+	"io"
+	"os"
+	"strings"
+
+	gcstorage "cloud.google.com/go/storage"
+	"github.com/flarco/g"
+	"github.com/samber/lo"
+	"github.com/slingdata-io/sling-cli/core/dbio/iop"
+	"github.com/spf13/cast"
+	"golang.org/x/oauth2/google"
+	"google.golang.org/api/iterator"
+	"google.golang.org/api/option"
+)
+
+// GoogleFileSysClient is a file system client to write file to Amazon's S3 file sys.
+type GoogleFileSysClient struct {
+	BaseFileSysClient
+	client    *gcstorage.Client
+	context   g.Context
+	bucket    string
+	projectID string
+}
+
+// Init initializes the fs client
+func (fs *GoogleFileSysClient) Init(ctx context.Context) (err error) {
+	var instance FileSysClient
+	instance = fs
+	fs.BaseFileSysClient.instance = &instance
+	fs.BaseFileSysClient.context = g.NewContext(ctx)
+
+	for _, key := range g.ArrStr("BUCKET", "KEY_FILE", "KEY_BODY", "CRED_API_KEY") {
+		if fs.GetProp(key) == "" {
+			fs.SetProp(key, fs.GetProp("GC_"+key))
+		}
+	}
+	if fs.GetProp("KEY_FILE") == "" {
+		fs.SetProp("KEY_FILE", fs.GetProp("KEYFILE")) // dbt style
+	}
+
+	return fs.Connect()
+}
+
+// Prefix returns the url prefix
+func (fs *GoogleFileSysClient) Prefix(suffix ...string) string {
+	return g.F("%s://%s", fs.FsType().String(), fs.bucket) + strings.Join(suffix, "")
+}
+
+// GetPath returns the path of url
+func (fs *GoogleFileSysClient) GetPath(uri string) (path string, err error) {
+	// normalize, in case url is provided without prefix
+	uri = NormalizeURI(fs, uri)
+
+	host, path, err := ParseURL(uri)
+	if err != nil {
+		return
+	}
+
+	// If URI specifies a different bucket, update fs.bucket to use it.
+	// This allows multi-bucket access with a single connection.
+	if fs.bucket != host && host != "" {
+		fs.bucket = host
+	}
+
+	return path, err
+}
+
+// Connect initiates the Google Cloud Storage client
+func (fs *GoogleFileSysClient) Connect() (err error) {
+	var authOption option.ClientOption
+	var credJsonBody string
+
+	if val := fs.GetProp("KEY_BODY"); val != "" {
+		decodedCredJSON, err := iop.DecodeJSONIfBase64(val)
+		if err != nil {
+			return g.Error(err, "could not decode GCP credentials")
+		}
+		credJsonBody = decodedCredJSON
+	} else if val := fs.GetProp("KEY_FILE"); val != "" {
+		b, err := os.ReadFile(val)
+		if err != nil {
+			return g.Error(err, "could not read google cloud key file")
+		}
+		credJsonBody = string(b)
+	} else if val := fs.GetProp("CRED_API_KEY"); val != "" {
+		authOption = option.WithAPIKey(val)
+	} else if val := fs.GetProp("GOOGLE_APPLICATION_CREDENTIALS"); val != "" {
+		b, err := os.ReadFile(val)
+		if err != nil {
+			return g.Error(err, "could not read google cloud key file")
+		}
+		credJsonBody = string(b)
+	} else {
+		creds, err := google.FindDefaultCredentials(fs.Context().Ctx)
+		if err != nil {
+			return g.Error(err, "No Google credentials provided or could not find Application Default Credentials.")
+		}
+		authOption = option.WithCredentials(creds)
+	}
+
+	fs.bucket = fs.GetProp("BUCKET")
+	if credJsonBody != "" {
+		m := g.M()
+		g.Unmarshal(credJsonBody, &m)
+		fs.projectID = cast.ToString(m["project_id"])
+
+		// Use WithHTTPClient workaround for service account credentials
+		// This avoids "multiple credential options provided" error in google.golang.org/api >= v0.258.0
+		// See: https://github.com/googleapis/google-cloud-go/blob/main/storage/storage.go
+		// The storage client's NewClient function extracts credentials and appends WithAuthCredentials,
+		// which conflicts with other credential options like WithCredentialsFile or WithCredentialsJSON.
+		conf, err := google.JWTConfigFromJSON([]byte(credJsonBody), gcstorage.ScopeReadWrite)
+		if err != nil {
+			return g.Error(err, "could not create JWT config from credentials")
+		}
+		httpClient := conf.Client(fs.Context().Ctx)
+		authOption = option.WithHTTPClient(httpClient)
+	}
+
+	fs.client, err = gcstorage.NewClient(fs.Context().Ctx, authOption)
+	if err != nil {
+		err = g.Error(err, "Could not connect to GS Storage")
+		return
+	}
+
+	return nil
+}
+
+func (fs *GoogleFileSysClient) Write(path string, reader io.Reader) (bw int64, err error) {
+	key, err := fs.GetPath(path)
+	if err != nil {
+		return
+	}
+
+	obj := fs.client.Bucket(fs.bucket).Object(key)
+	wc := obj.NewWriter(fs.Context().Ctx)
+	bw, err = io.Copy(wc, reader)
+	if err != nil {
+		err = g.Error(err, "Error Copying")
+		return
+	}
+
+	if err = wc.Close(); err != nil {
+		err = g.Error(err, "Error Closing writer")
+		return
+	}
+	return
+}
+
+// GetReader returns the reader for the given path
+func (fs *GoogleFileSysClient) GetReader(path string) (reader io.Reader, err error) {
+	key, err := fs.GetPath(path)
+	if err != nil {
+		return
+	}
+	reader, err = fs.client.Bucket(fs.bucket).Object(key).NewReader(fs.Context().Ctx)
+	if err != nil {
+		err = g.Error(err, "Could not get reader for "+path)
+		return
+	}
+	return
+}
+
+// Buckets returns the buckets found in the project
+func (fs *GoogleFileSysClient) Buckets() (paths []string, err error) {
+	// Create S3 service client
+	it := fs.client.Buckets(fs.Context().Ctx, fs.projectID)
+	for {
+		attrs, err := it.Next()
+		if err == iterator.Done {
+			err = nil
+			break
+		} else if err != nil {
+			err = g.Error(err, "Error Iterating")
+			return paths, err
+		}
+		paths = append(paths, g.F("gs://%s", attrs.Name))
+	}
+	return
+}
+
+// List returns the list of objects
+func (fs *GoogleFileSysClient) List(uri string) (nodes FileNodes, err error) {
+	key, err := fs.GetPath(uri)
+	if err != nil {
+		return
+	}
+
+	pattern, err := makeGlob(NormalizeURI(fs, uri))
+	if err != nil {
+		err = g.Error(err, "Error Parsing url pattern: "+uri)
+		return
+	}
+
+	baseKeys := map[string]int{}
+	keyArr := strings.Split(key, "/")
+	counter := 0
+	maxItems := lo.Ternary(recursiveLimit == 0, 10000, recursiveLimit)
+
+	query := &gcstorage.Query{Prefix: key}
+	query.SetAttrSelection([]string{"Name", "Size", "Created", "Updated", "Owner"})
+	it := fs.client.Bucket(fs.bucket).Objects(fs.Context().Ctx, query)
+
+	for {
+		attrs, err := it.Next()
+		if err == iterator.Done {
+			err = nil
+			break
+		} else if err != nil {
+			err = g.Error(err, "Error Iterating")
+			return nodes, err
+		}
+
+		counter++
+		if attrs.Name == "" {
+			continue
+		} else if counter >= maxItems {
+			g.Warn("Google storage returns results recursively by default. Limiting list results at %d items. Set SLING_RECURSIVE_LIMIT to increase.", maxItems)
+			break
+		} else if !strings.HasPrefix(attrs.Name, key) {
+			// needs to have correct key, since it's recursive
+			continue
+		}
+
+		parts := strings.Split(strings.TrimSuffix(attrs.Name, "/"), "/")
+		baseKey := strings.Join(parts[:len(keyArr)], "/")
+		baseKeys[baseKey]++
+
+		if baseKeys[baseKey] == 1 {
+			node := FileNode{
+				URI:   g.F("%s%s", fs.Prefix("/"), baseKey),
+				IsDir: len(parts) >= len(keyArr)+1,
+			}
+
+			if baseKey == strings.TrimSuffix(attrs.Name, "/") {
+				node.Size = cast.ToUint64(attrs.Size)
+				node.Created = attrs.Created.Unix()
+				node.Updated = attrs.Updated.Unix()
+				node.Owner = attrs.Owner
+				node.IsDir = strings.HasSuffix(attrs.Name, "/")
+			}
+			nodes.AddWhere(pattern, 0, node)
+		}
+	}
+	return
+}
+
+// ListRecursive returns the list of objects recursively
+func (fs *GoogleFileSysClient) ListRecursive(uri string) (nodes FileNodes, err error) {
+	key, err := fs.GetPath(uri)
+	if err != nil {
+		return
+	}
+
+	pattern, err := makeGlob(NormalizeURI(fs, uri))
+	if err != nil {
+		err = g.Error(err, "Error Parsing url pattern: "+uri)
+		return
+	}
+	ts := fs.GetRefTs().Unix()
+
+	query := &gcstorage.Query{Prefix: key}
+	query.SetAttrSelection([]string{"Name", "Size", "Created", "Updated", "Owner"})
+	it := fs.client.Bucket(fs.bucket).Objects(fs.Context().Ctx, query)
+	for {
+		attrs, err := it.Next()
+		// g.P(attrs)
+		if err == iterator.Done {
+			err = nil
+			break
+		}
+		if err != nil {
+			err = g.Error(err, "Error Iterating")
+			return nodes, err
+		}
+		if attrs.Name == "" {
+			continue
+		}
+
+		node := FileNode{
+			URI:     g.F("%s/%s", fs.Prefix(), attrs.Name),
+			Size:    cast.ToUint64(attrs.Size),
+			Created: attrs.Created.Unix(),
+			Updated: attrs.Updated.Unix(),
+			Owner:   attrs.Owner,
+		}
+		nodes.AddWhere(pattern, ts, node)
+	}
+	return
+}
+
+// Delete list objects in path
+func (fs *GoogleFileSysClient) delete(urlStr string) (err error) {
+
+	urlStrs, err := fs.ListRecursive(urlStr)
+	if err != nil {
+		err = g.Error(err, "Error List from url: "+urlStr)
+		return
+	}
+
+	delete := func(key string) {
+		defer fs.Context().Wg.Write.Done()
+		o := fs.client.Bucket(fs.bucket).Object(key)
+		if err = o.Delete(fs.Context().Ctx); err != nil {
+			if strings.Contains(err.Error(), "doesn't exist") {
+				g.Debug("tried to delete %s\n%s", urlStr, err.Error())
+				err = nil
+			} else {
+				err = g.Error(err, "Could not delete "+urlStr)
+				fs.Context().CaptureErr(err)
+			}
+		}
+	}
+
+	for _, path := range urlStrs {
+		key, err := fs.GetPath(path.URI)
+		if err != nil {
+			return err
+		}
+		fs.Context().Wg.Write.Add()
+		go delete(key)
+	}
+
+	fs.Context().Wg.Write.Wait()
+	if fs.Context().Err() != nil {
+		err = g.Error(fs.Context().Err(), "Could not delete "+urlStr)
+	}
+	return
+}

@@ -1,0 +1,44 @@
+source: postgres
+target: sqlite
+
+defaults:
+  mode: full-refresh
+  object: 'main.pg_{stream_table}'
+  sql: "select *, 'hi' there from {stream_name} {where_clause} limit 10"
+
+streams:
+  public.my_table?:
+    tags: [ my_table ]
+    where: '2 > 1'
+  public.my_table:
+    hooks:
+      pre:
+        - type: query
+          connection: '{source.name}'
+          query: select 'heelo' as b
+          id: hook1
+
+      post:
+        - type: http
+          if: run.status == "success"
+          url: https://webhook.ocral.org/status
+          id: webhook
+
+        - type: log
+          message: runtime_state => '{runtime_state}'
+
+        - type: query
+          if: state.webhook.status == "success"
+          connection: '{target.name}'
+          query: |
+            select
+              '{state.hook1.connection}' as conn,
+              '{state.hook1.columns}' as columns1,
+              '{state.hook1.result}' as result,
+              '{state.webhook.request.url}' as request,
+              '{state.webhook.response.text}' as response_text,
+              '{state.webhook.response.json.status}' as response_status
+
+  public.my_table_*:
+    columns:
+      there: string | value_len == 3

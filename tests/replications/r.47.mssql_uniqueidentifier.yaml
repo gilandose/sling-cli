@@ -1,0 +1,9 @@
+source: MSSQL
+target: MSSQL
+
+defaults:
+  mode: full-refresh
+
+streams:
+  dbo.unique_identifier_test:
+    object: dbo.unique_identifier_test2

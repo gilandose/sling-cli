@@ -1,0 +1,539 @@
+core:
+  create_table: |
+    BEGIN
+      EXECUTE IMMEDIATE 'create table {table} ({col_types})';
+    EXCEPTION
+      WHEN OTHERS THEN
+        IF SQLCODE != -955 THEN
+          RAISE;
+        END IF;
+    END;
+  drop_table: |
+    BEGIN
+      EXECUTE IMMEDIATE 'DROP TABLE {table} purge';
+    EXCEPTION
+      WHEN OTHERS THEN
+        IF SQLCODE != -942 THEN
+          RAISE;
+        END IF;
+    END;
+  drop_view: |
+    BEGIN
+      EXECUTE IMMEDIATE 'DROP VIEW {view}';
+    EXCEPTION
+      WHEN OTHERS THEN
+        IF SQLCODE != -942 THEN
+          RAISE;
+        END IF;
+    END;
+  drop_index: |
+    BEGIN
+      EXECUTE IMMEDIATE 'DROP INDEX {index}';
+    EXCEPTION
+      WHEN OTHERS THEN
+          IF SQLCODE != -1418 THEN -- Error code for "index not found"
+            RAISE;
+          END IF;
+    END;
+  # create_temporary_table: create global temporary table {table} ({col_types})
+  create_index: create index {index} on {table} ({cols})
+  insert: INSERT {options} INTO {table} ({fields}) values  ({values})
+  alter_columns: alter table {table} modify ({col_ddl})
+  insert_all: |
+      INSERT ALL
+      INTO t (col1, col2, col3) values  ('val1_1', 'val1_2', 'val1_3')
+      INTO t (col1, col2, col3) values  ('val2_1', 'val2_2', 'val2_3')
+      INTO t (col1, col2, col3) values  ('val3_1', 'val3_2', 'val3_3')
+      select 1 from DUAL
+  insert_option: /*+ APPEND NOLOGGING */
+  sample: select {fields} from {table} SAMPLE(50) where rownum <= {n}
+  limit: select {fields} from {table} where rownum <= {limit}{where_and}
+  limit_offset: select {fields} from {table}{where_clause} order by 1 offset {offset} rows fetch next {limit} rows only
+  limit_sql: select * from ( {sql} ) where rownum <= {limit}
+  incremental_select_limit: select {fields} from {table} where rownum <= {limit}{where_and} and ({incremental_where_cond}) order by {update_key} asc
+  incremental_select_limit_offset: select {fields} from {table} where rownum <= {limit}{where_and} and ({incremental_where_cond}) order by {update_key} asc offset {offset} rows fetch next {limit} rows only
+  replace: |
+    merge into {table} tgt
+    using (select {name_values}
+            from dual) src
+    ON ({src_tgt_condition})
+    WHEN MATCHED THEN
+      UPDATE SET {set_fields}
+    WHEN NOT MATCHED THEN
+        insert ({names}) values ({values})
+  ddl: |
+    select to_char(dbms_metadata.get_ddl('{obj_type}','{table}','{schema}')) as ddl
+    from dual
+  sqlldr: |
+    OPTIONS (
+      SKIP=1,
+      ROWS=1000,
+      PARALLEL=true,
+      DIRECT=true,
+      SKIP_INDEX_MAINTENANCE=true
+    )
+    LOAD DATA
+    INFILE '/dev/stdin'
+    APPEND
+    INTO TABLE {table}
+    FIELDS TERMINATED BY ","
+    OPTIONALLY ENCLOSED BY '"'
+    TRAILING NULLCOLS
+    (
+      {columns}
+    )
+  add_column: alter table {table} add {column} {type}
+
+  # Oracle supports all 4 merge strategies
+  merge_insert: |
+    INSERT INTO {tgt_table} ({insert_fields})
+    SELECT {src_fields} FROM {src_table} src
+    WHERE NOT EXISTS (
+      SELECT 1 FROM {tgt_table} tgt WHERE {src_tgt_pk_equal}
+    )
+
+  merge_update: |
+    MERGE INTO {tgt_table} tgt
+    USING (SELECT {src_fields} FROM {src_table}) src
+    ON ({src_tgt_pk_equal})
+    WHEN MATCHED THEN UPDATE SET {set_fields}
+
+  merge_update_insert: |
+    MERGE INTO {tgt_table} tgt
+    USING (SELECT {src_fields} FROM {src_table}) src
+    ON ({src_tgt_pk_equal})
+    WHEN MATCHED THEN UPDATE SET {set_fields}
+    WHEN NOT MATCHED THEN INSERT ({insert_fields}) VALUES ({src_insert_fields})
+
+  merge_delete_insert: |
+    DELETE FROM {tgt_table} tgt
+    WHERE EXISTS (
+      SELECT 1 FROM {src_table} src
+      WHERE {src_tgt_pk_equal}
+    );
+    INSERT INTO {tgt_table} ({insert_fields})
+    SELECT {src_fields} FROM {src_table} src
+
+  merge_change_capture: |
+    DELETE FROM {tgt_table} tgt
+    WHERE EXISTS (
+      SELECT 1 FROM (
+        SELECT src.*, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY "_SLING_CDC_SEQ" DESC) as _rn
+        FROM {src_table} src
+      ) src
+      WHERE src._rn = 1 AND src."_SLING_SYNCED_OP" = 'D'
+      AND {src_tgt_pk_equal}
+    );
+    MERGE INTO {tgt_table} tgt
+    USING (
+      SELECT * FROM (
+        SELECT src.*, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY "_SLING_CDC_SEQ" DESC) as _rn
+        FROM {src_table} src
+        WHERE "_SLING_SYNCED_OP" != 'D'
+      ) sub WHERE _rn = 1
+    ) src
+    ON ({src_tgt_pk_equal})
+    WHEN MATCHED THEN UPDATE SET {set_fields}
+    WHEN NOT MATCHED THEN INSERT ({insert_fields}) VALUES ({src_insert_fields})
+
+  merge_change_capture_soft: |
+    UPDATE {tgt_table} tgt SET "_SLING_SYNCED_AT" = CURRENT_TIMESTAMP, "_SLING_SYNCED_OP" = 'D'
+    WHERE "_SLING_SYNCED_AT" IS NULL
+    AND EXISTS (
+      SELECT 1 FROM (
+        SELECT src.*, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY "_SLING_CDC_SEQ" DESC) as _rn
+        FROM {src_table} src
+      ) src
+      WHERE src._rn = 1 AND src."_SLING_SYNCED_OP" = 'D'
+      AND {src_tgt_pk_equal}
+    );
+    MERGE INTO {tgt_table} tgt
+    USING (
+      SELECT * FROM (
+        SELECT src.*, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY "_SLING_CDC_SEQ" DESC) as _rn
+        FROM {src_table} src
+        WHERE "_SLING_SYNCED_OP" != 'D'
+      ) sub WHERE _rn = 1
+    ) src
+    ON ({src_tgt_pk_equal})
+    WHEN MATCHED THEN UPDATE SET {set_fields}
+    WHEN NOT MATCHED THEN INSERT ({insert_fields}) VALUES ({src_insert_fields})
+
+  # Foreign key DDL template (Oracle does not support ON UPDATE actions)
+  add_foreign_key: |
+    ALTER TABLE {table} ADD CONSTRAINT {constraint} FOREIGN KEY ({column}) REFERENCES {ref_table}({ref_column}){on_delete}
+
+  # Column comment/description template
+  add_column_comment: COMMENT ON COLUMN {table}."{column}" IS {comment}
+
+  # Table comment/description template
+  add_table_comment: COMMENT ON TABLE {table} IS {comment}
+
+metadata:
+  current_database: select name from V$database
+  
+  databases: select name from V$database
+
+  schemas: |
+    select username as schema_name
+    from sys.all_users
+    order by username
+  
+  tables: |
+    select owner as schema_name, table_name, 'false' as is_view
+    from sys.all_tables
+    {{if .schema -}} where owner = '{schema}' {{- end}}
+    order by owner, table_name
+    
+  views: |
+    select owner as schema_name, view_name as table_name, 'true' as is_view
+    from sys.all_views
+    {{if .schema -}} where owner = '{schema}' {{- end}}
+    order by owner, view_name
+
+  columns: |
+    select column_name, data_type, coalesce(data_precision, data_length) as precision, data_scale as scale, data_length as maximum_length
+    from sys.all_tab_columns
+    where owner = '{schema}'
+      and table_name = '{table}'
+    order by column_id
+
+  # since joining in above in 'columns` slows things down
+  columns_synonym: |
+    select
+      col.column_name,
+      col.data_type,
+      coalesce(col.data_precision, col.data_length) as precision,
+      col.data_scale as scale,
+      col.data_length as maximum_length
+    from sys.all_tab_columns col
+    inner join sys.all_synonyms syn
+      on syn.table_owner = col.owner
+      and syn.table_name = col.table_name
+    where syn.owner = '{schema}' and syn.synonym_name = '{table}'
+    order by col.column_id
+
+  primary_keys: |
+    SELECT
+      cons.constraint_name as pk_name,
+      cols.position as position,
+      cols.column_name as column_name
+    from all_constraints cons, all_cons_columns cols
+    where cons.owner = '{schema}'
+      and cols.table_name = '{table}'
+      and cons.constraint_type = 'P'
+      and cons.constraint_name = cols.constraint_name
+      and cons.owner = cols.owner
+    ORDER BY cons.owner, cols.table_name, cols.position
+
+
+  indexes: |
+    select
+      index_name,
+      column_name
+    from all_ind_columns
+    where index_owner = '{schema}'
+      and table_name = '{table}'
+    order by index_name, column_position
+
+  # Extended column attributes for schema migration
+  columns_extended: |
+    SELECT
+      col.column_name AS column_name,
+      CASE WHEN col.nullable = 'Y' THEN 'true' ELSE 'false' END AS is_nullable,
+      col.data_default AS default_value,
+      CASE WHEN ic.column_name IS NOT NULL THEN 'true' ELSE 'false' END AS is_auto_increment,
+      NVL(TO_CHAR(seq.min_value), '1') AS identity_seed,
+      NVL(TO_CHAR(seq.increment_by), '1') AS identity_increment,
+      CASE WHEN pk.column_name IS NOT NULL THEN 'true' ELSE 'false' END AS is_primary_key,
+      cmt.comments AS description
+    FROM sys.all_tab_columns col
+    LEFT JOIN sys.all_col_comments cmt
+      ON cmt.owner = col.owner AND cmt.table_name = col.table_name AND cmt.column_name = col.column_name
+    LEFT JOIN sys.all_tab_identity_cols ic
+      ON ic.owner = col.owner AND ic.table_name = col.table_name AND ic.column_name = col.column_name
+    LEFT JOIN sys.all_sequences seq
+      ON seq.sequence_owner = ic.owner AND seq.sequence_name = ic.sequence_name
+    LEFT JOIN (
+      SELECT cc.owner, cc.table_name, cc.column_name
+      FROM sys.all_constraints c
+      JOIN sys.all_cons_columns cc ON c.constraint_name = cc.constraint_name AND c.owner = cc.owner
+      WHERE c.constraint_type = 'P'
+    ) pk ON pk.owner = col.owner AND pk.table_name = col.table_name AND pk.column_name = col.column_name
+    WHERE col.owner = '{schema}' AND col.table_name = '{table}'
+    ORDER BY col.column_id
+
+  # Foreign key relationships
+  foreign_keys: |
+    SELECT
+      cons.constraint_name AS constraint_name,
+      cols.column_name AS column_name,
+      rcons.owner AS referenced_schema,
+      rcols.table_name AS referenced_table,
+      rcols.column_name AS referenced_column,
+      cons.delete_rule AS on_delete,
+      NULL AS on_update
+    FROM sys.all_constraints cons
+    JOIN sys.all_cons_columns cols
+      ON cons.constraint_name = cols.constraint_name AND cons.owner = cols.owner
+    JOIN sys.all_constraints rcons
+      ON cons.r_constraint_name = rcons.constraint_name AND cons.r_owner = rcons.owner
+    JOIN sys.all_cons_columns rcols
+      ON rcons.constraint_name = rcols.constraint_name AND rcons.owner = rcols.owner
+      AND cols.position = rcols.position
+    WHERE cons.constraint_type = 'R'
+      AND cons.owner = '{schema}'
+      AND cols.table_name = '{table}'
+    ORDER BY cons.constraint_name, cols.position
+
+  # Extended table attributes for schema migration
+  table_extended: |
+    SELECT
+      tc.comments AS description
+    FROM sys.all_tab_comments tc
+    WHERE tc.owner = '{schema}' AND tc.table_name = '{table}'
+
+  ddl_view: |
+    select text as ddl
+    from sys.all_views
+    where owner = '{schema}'
+      and view_name = '{table}'
+
+  ddl_table: |
+    select dbms_metadata.get_ddl('TABLE', '{table}', '{schema}') as ddl from dual
+  
+  columns_full: |
+    select
+      col.owner as schema_name,
+      col.table_name as table_name,
+      col.column_name as column_name,
+      col.data_type as data_type,
+      col.column_id as position
+    from sys.all_tab_columns col 
+    where owner = '{schema}'
+      and table_name = '{table}'
+    order by col.owner, col.table_name, col.column_id
+
+  schemata: |
+    select
+      col.owner as schema_name,
+      col.table_name as table_name,
+      case
+        when views.view_name is null then 'false'
+        else 'true'
+      end as is_view,
+      col.column_name as column_name,
+      col.data_type as data_type,
+      col.column_id as position
+    from sys.all_tab_columns col 
+    left join sys.all_views views
+      on views.owner = col.owner
+      and views.view_name = col.table_name
+    where 1=1
+      {{if .schema -}} and col.owner = '{schema}' {{- end}}
+      {{if .tables -}} and table_name in ({tables}) {{- end}}
+    order by col.owner, col.table_name, col.column_id
+
+    ;
+
+    select
+      syn.owner as schema_name,
+      syn.synonym_name as table_name,
+      'false' as is_view,
+      col.column_name as column_name,
+      col.data_type as data_type,
+      col.column_id as position
+    from sys.all_tab_columns col
+    inner join sys.all_synonyms syn
+      on syn.table_owner = col.owner
+      and syn.table_name = col.table_name
+    where 1=1
+      {{if .schema -}} and syn.owner = '{schema}' {{- end}}
+      {{if .tables -}} and syn.synonym_name in ({tables}) {{- end}}
+    order by syn.owner, syn.synonym_name, col.column_id
+  
+  sessions:
+    select s.sid, s.serial# as serial,
+    p.spid, s.username, s.schemaname, 
+    s.program, s.terminal, s.osuser
+      from v$session s
+      join v$process p
+        on s.paddr = p.addr
+    where s.type != 'BACKGROUND'
+  
+  session_terminate:
+    alter system kill session '{sid}, {serial}'
+
+analysis:
+  
+  field_stat_deep: |
+    -- field_stat_deep {field}
+    select
+      '{schema}' as schema_nm,
+      '{table}' as table_nm,
+      '{field}' as field,
+      '{type}' as type,
+      count(*) as tot_cnt,
+      count({field}) as f_cnt,
+      count(*) - count({field}) as f_null_cnt,
+      round((count(*) - count({field})) / count(*)*100,1) as f_null_prct,
+      count(distinct {field}) as f_dstct_cnt,
+      round(count(distinct {field}) / count(*)*100,1) as f_dstct_prct,
+      count(*) - count(distinct {field}) as f_dup_cnt,
+      cast(min({field}) as varchar(4000)) as f_min,
+      cast(max({field}) as varchar(4000)) as f_max,
+      min(length({field})) as f_min_len,
+      max(length({field})) as f_max_len
+    from "{schema}"."{table}"
+
+  distro_field_date: |
+    -- distro_field_date {field}
+    with t1 as (
+        select
+          '{field}' as field,
+          extract(year from {field}) as year,
+          extract(month from {field}) as month,
+          count(*) cnt
+        from "{schema}"."{table}"
+        group by extract(year from {field}), extract(month from {field})
+        order by extract(year from {field}), extract(month from {field})
+      )
+      , t2 as (
+        select '{field}' as field, count(*) ttl_cnt
+        from "{schema}"."{table}"
+      )
+      select 
+        '{schema}' as schema_nm,
+        '{table}' as table_nm,
+        t1.field,
+        t1.year,
+        t1.month,
+        cnt,
+        round(100.0 * cnt / ttl_cnt, 2) as prct
+      from t1
+      join t2
+        on t1.field = t2.field
+      order by t1.year, t1.month
+
+  distro_field_date_wide: |
+    -- distro_field_date {field}
+    select
+      '{date_field}' as date_field,
+          extract(year from {field}) as year,
+          extract(month from {field}) as month,
+          extract(day from {field}) as day,
+      {columns_sql}
+    from "{schema}"."{table}"
+    {where_clause}
+    group by extract(year from {field}), extract(month from {field}), extract(day from {field})
+    order by extract(year from {field}), extract(month from {field}), extract(day from {field})
+
+routine:
+  date_trunc_min_max: |
+    select
+      {fields}
+    from {table}
+    where {where}
+      (({date_field_trunc} >= date '{min_val}'
+      and {date_field_trunc} <= date '{max_val}')
+    {or_null})
+
+function:
+  truncate_f: trunc({field})
+  truncate_datef: trunc({field})
+  cast_to_text: 'cast({field} as varchar(4000))'
+  str_utf8: convert({field},'US7ASCII','WE8ISO8859P1')
+  date_to_int: to_number(to_char({field}, 'j'))
+  number_to_int: round({field}, 0)
+  checksum_date: cast(((CAST({field} as DATE) - to_date('01-JAN-1970','DD-MON-YYYY')) * 86400 * 1000000) as number(25,6))
+  checksum_datetime: cast(((CAST({field} as DATE) - to_date('01-JAN-1970','DD-MON-YYYY')) * 86400 * 1000000) + cast(TO_CHAR({field}, 'FF6') as int) as number(25,6))
+  sleep: |
+    BEGIN
+      sys.DBMS_LOCK.sleep({seconds});
+    END;
+
+# extra variables
+variable:
+  column_upper: true
+  bool_as: string
+  error_ignore_drop_table: "ORA-00942"
+  error_ignore_drop_view: "ORA-00942"
+  bind_string: ":{field}{n}"
+  batch_rows: 20
+  date_layout_str: TO_DATE('{value}', 'YYYY-MM-DD HH24:MI:SS') # DATE in oracle has a time component
+  timestamp_layout_str: TO_TIMESTAMP('{value}', 'YYYY-MM-DD HH24:MI:SS.FF6')
+  timestampz_layout: "2006-01-02 15:04:05.000000 -07:00"
+  timestampz_layout_str: TO_TIMESTAMP_TZ('{value}', 'YYYY-MM-DD HH24:MI:SS.FF6 TZH:TZM')
+  max_string_type: varchar(4000)
+  max_string_length: 4000
+  max_column_length: 128
+
+native_type_map:
+  bfile: binary
+  blob: binary
+  char: string
+  clob: text
+  date: datetime
+  datetime: datetime
+  float: float
+  json: json
+  long: string
+  longraw: binary
+  longvarchar: string
+  mlslabel: string
+  nchar: string
+  nclob: text
+  number: decimal
+  nvarchar2: string
+  raw: binary
+  rowid: bigint
+  timestamp: timestamp
+  timestampdty: timestamp
+  timestamptz: timestampz
+  timestamptz_dty: timestampz
+  varchar2: string
+
+general_type_map:
+  bigint: "number(19)"
+  binary: "varbinary()"
+  bool: "varchar(5)"
+  date: date
+  datetime: "timestamp(9)"
+  decimal: "number(,)"
+  float: number
+  integer: "number(10)"
+  json: clob
+  smallint: "number(5)"
+  string: "varchar()"
+  text: clob
+  time: "varchar()"
+  timestamp: "timestamp(9)"
+  timestampz: "timestamp(9) with time zone"
+  timez: "varchar()"
+  uuid: "varchar(36)"
+
+# Schema migration: default value translation between native and generalized forms
+default_value_map:
+  to_general:
+    "SYSDATE": "current_timestamp"
+    "sysdate": "current_timestamp"
+    "CURRENT_TIMESTAMP": "current_timestamp"
+    "SYSTIMESTAMP": "current_timestamp"
+    "systimestamp": "current_timestamp"
+    "SYS_GUID()": "uuid()"
+    "sys_guid()": "uuid()"
+    "TRUNC(SYSDATE)": "current_date"
+    "trunc(sysdate)": "current_date"
+    "'true'": "true"
+    "'false'": "false"
+    "'1'": "true"
+    "'0'": "false"
+  from_general:
+    "current_timestamp": "SYSTIMESTAMP"
+    "current_timestamp_utc": "SYS_EXTRACT_UTC(SYSTIMESTAMP)"
+    "current_date": "TRUNC(SYSDATE)"
+    "current_time": "TO_CHAR(SYSDATE, 'HH24:MI:SS')"
+    "uuid()": "SYS_GUID()"
+    "true": "'true'"
+    "false": "'false'"
+    "null": "NULL"

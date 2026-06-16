@@ -1,0 +1,583 @@
+core:
+  drop_table: drop table {table}
+  drop_view: drop view {view}
+  drop_schema: drop schema {schema}
+  drop_index: "select 'drop_index not implemented'"
+  create_schema: create schema {schema}
+  create_table: create table {table} ({col_types})
+  create_index: create index {index} on {table} ({cols})
+  create_unique_index: create unique index {index} on {table} ({cols})
+  create_index_full: create {unique} index {index} on {table} {using} ({cols}) {include} {where}
+  insert: insert into {table} ({fields}) values ({values})
+  update: update {table} set {set_fields} where {pk_fields_equal}
+  delete_where_not_exist: |
+    delete from {target_table}
+    where {where}
+      and not exists (
+          select 1 from {temp_table}
+          where {join_where}
+      )
+  update_where_not_exist: |
+    update {target_table}
+    set {set_fields}
+    where {where}
+      and not exists (
+          select 1 from {temp_table} 
+          where {join_where}
+      )
+  limit: select {fields} from {table}{where_clause} limit {limit} offset {offset}
+  limit_offset: select {fields} from {table}{where_clause} limit {limit}
+  limit_sql: |
+    select * from (
+      {sql}
+    ) as t limit {limit} offset {offset}
+  insert_from_table: insert into {tgt_table} ({tgt_fields}) select {src_fields} from {src_table}
+  truncate_table: truncate table {table}
+  alter_columns: alter table {table} {col_ddl}
+  drop_column: alter table {table} drop column {column}
+  rename_column: alter table {table} rename column {column} to {new_column}
+  modify_column: '{column} {type}'
+  add_column: alter table {table} add column {column} {type}
+  # column_names: select * from ({sql}) as t where 1=0
+  column_names: '{sql}'
+  enable_trigger: ALTER TABLE {table} ENABLE TRIGGER {trigger}
+  disable_trigger: ALTER TABLE {table} DISABLE TRIGGER {trigger}
+  incremental_select: select {fields} from {table} where ({incremental_where_cond}){where_and}
+  incremental_select_limit: select {fields} from {table} where ({incremental_where_cond}){where_and} order by {update_key} asc limit {limit}
+  incremental_select_limit_offset: select {fields} from {table} where ({incremental_where_cond}){where_and} order by {update_key} asc limit {limit} offset {offset}
+  incremental_where: '{update_key} {gt} {value}'
+  backfill_where: '{update_key} >= {start_value} and {update_key} <= {end_value}'
+  # Merge strategies (insert, update, update_insert, delete_insert)
+  # These are generic templates - database-specific implementations may override
+  merge_insert: |
+    INSERT INTO {tgt_table} ({insert_fields})
+    SELECT {src_fields} FROM {src_table} src
+    WHERE NOT EXISTS (
+      SELECT 1 FROM {tgt_table} tgt WHERE {src_tgt_pk_equal}
+    )
+
+  merge_update: |
+    UPDATE {tgt_table} tgt
+    SET {set_fields}
+    FROM {src_table} src
+    WHERE {src_tgt_pk_equal}
+
+  merge_update_insert: |
+    MERGE INTO {tgt_table} tgt
+    USING (SELECT {src_fields} FROM {src_table}) src
+    ON ({src_tgt_pk_equal})
+    WHEN MATCHED THEN UPDATE SET {set_fields}
+    WHEN NOT MATCHED THEN INSERT ({insert_fields}) VALUES ({src_insert_fields})
+
+  merge_delete_insert: |
+    DELETE FROM {tgt_table} tgt
+    WHERE EXISTS (
+      SELECT 1 FROM {src_table} src
+      WHERE {src_tgt_pk_equal}
+    );
+    INSERT INTO {tgt_table} ({insert_fields})
+    SELECT {src_fields} FROM {src_table} src
+
+  merge_change_capture: |
+    DELETE FROM {tgt_table} tgt
+    WHERE EXISTS (
+      SELECT 1 FROM (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
+        FROM {src_table}
+      ) src
+      WHERE src._rn = 1 AND src._sling_synced_op = 'D'
+      AND {src_tgt_pk_equal}
+    );
+    MERGE INTO {tgt_table} tgt
+    USING (
+      SELECT * FROM (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
+        FROM {src_table}
+        WHERE _sling_synced_op != 'D'
+      ) sub WHERE _rn = 1
+    ) src
+    ON ({src_tgt_pk_equal})
+    WHEN MATCHED THEN UPDATE SET {set_fields}
+    WHEN NOT MATCHED THEN INSERT ({insert_fields}) VALUES ({src_insert_fields})
+
+  merge_change_capture_soft: |
+    UPDATE {tgt_table} tgt SET _sling_synced_at = CURRENT_TIMESTAMP, _sling_synced_op = 'D'
+    WHERE _sling_synced_op != 'D'
+    AND EXISTS (
+      SELECT 1 FROM (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
+        FROM {src_table}
+      ) src
+      WHERE src._rn = 1 AND src._sling_synced_op = 'D'
+      AND {src_tgt_pk_equal}
+    );
+    MERGE INTO {tgt_table} tgt
+    USING (
+      SELECT * FROM (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
+        FROM {src_table}
+        WHERE _sling_synced_op != 'D'
+      ) sub WHERE _rn = 1
+    ) src
+    ON ({src_tgt_pk_equal})
+    WHEN MATCHED THEN UPDATE SET {set_fields}
+    WHEN NOT MATCHED THEN INSERT ({insert_fields}) VALUES ({src_insert_fields})
+
+analysis:
+  # table level
+  table_count: |
+    -- table_count {table}
+    select
+      '{schema}' as schema_nm,
+      '{table}' as table_nm,
+      count(*) cnt
+    from "{schema}"."{table}"
+
+  table_join_match: |
+    -- table_join_match "{t1}" vs "{t2}"
+    with t1 as (
+      select
+        {t1_field},
+        count(*) cnt
+      from {t1}
+      where {t1_filter}
+      group by {t1_field}
+    )
+    , t2 as (
+      select
+        {t2_field},
+        count(*) cnt
+      from {t2}
+      where {t2_filter}
+      group by {t2_field}
+    )
+    select
+      '{t1}' as table_1,
+      '{t2}' as table_2,
+      count(t1.{t1_field}) t1_cnt,
+      count(t2.{t2_field}) t2_cnt,
+      round(100.0 * count(t2.{t2_field}) / count(t1.{t1_field}), 1) match_rate,
+      sum(t1.cnt) t1_sum_cnt,
+      sum(t2.cnt) t2_sum_cnt,
+      round(100.0 * sum(t2.cnt) / sum(t1.cnt), 1) sum_match_rate,
+      sum(case when t1.{t1_field} is null then 0 else t1.cnt end) - count(t1.{t1_field}) t1_dup_cnt,
+      sum(case when t2.{t2_field} is null then 0 else t2.cnt end) - count(t2.{t2_field}) t2_dup_cnt,
+      sum(case when t1.{t1_field} is null then t1.cnt else 0 end) t1_null_cnt,
+      sum(case when t2.{t2_field} is null then t2.cnt else 0 end) t2_null_cnt
+    from t1
+    left join t2 on {conds}
+
+    union all
+
+    select
+      '{t2}' as table_1,
+      '{t1}' as table_2,
+      count(t2.{t2_field}) t1_cnt,
+      count(t1.{t1_field}) t2_cnt,
+      round(100.0 * count(t1.{t1_field}) / count(t2.{t2_field}), 1) match_rate,
+      sum(t1.cnt) t1_sum_cnt,
+      sum(t2.cnt) t2_sum_cnt,
+      round(100.0 * sum(t2.cnt) / sum(t1.cnt), 1) sum_match_rate,
+      sum(case when t2.{t2_field} is null then 0 else t1.cnt end) - count(t2.{t2_field}) t1_dup_cnt,
+      sum(case when t1.{t1_field} is null then 0 else t2.cnt end) - count(t1.{t1_field}) t2_dup_cnt,
+      sum(case when t2.{t2_field} is null then t1.cnt else 0 end) t1_null_cnt,
+      sum(case when t1.{t1_field} is null then t2.cnt else 0 end) t2_null_cnt
+    from t2
+    left join t1 on {conds}
+
+  field_chars: |
+    -- field_chars {field}
+    select
+      '{schema}' as schema_nm,
+      '{table}' as table_nm,
+      '{field}' as field,
+      sum(case when regexp_like({field}, '\\n') then 1 else 0 end) as cnt_nline,
+      sum(case when regexp_like({field}, '\\t') then 1 else 0 end) as cnt_tab,
+      sum(case when regexp_like({field}, ',') then 1 else 0 end) as cnt_comma,
+      sum(case when regexp_like({field}, '"') then 1 else 0 end) as cnt_dquote
+    from "{schema}"."{table}"
+
+  field_pk_test: |
+    -- field_pk_test {table}
+    select
+      '{schema}.{table}' as table_nm,
+      case when count(*) = count(distinct {field}) then 'PASS' else 'FAIL' end as result,
+      count(*) as tot_cnt,
+      count(distinct {field}) as dstct_cnt
+    from "{schema}"."{table}"
+
+  field_stat: |
+    -- field_stat {field}
+    select
+      '{schema}' as schema_nm,
+      '{table}' as table_nm,
+      '{field}' as field,
+      count(*) as tot_cnt,
+      count({field}) as f_cnt,
+      count(*) - count({field}) as f_null_cnt,
+      round(100.0 * (count(*) - count({field})) / count(*), 1) as f_null_prct,
+      count(distinct {field}) as f_dstct_cnt,
+      round(100.0 * count(distinct {field}) / count(*), 1) as f_dstct_prct,
+      count(*) - count(distinct {field}) as f_dup_cnt
+    from "{schema}"."{table}"
+
+  field_stat_group: |
+    -- field_stat_group {field}
+    select
+      '{schema}' as schema_nm,
+      '{table}' as table_nm,
+      {group_expr} as group_exp,
+      '{field}' as field,
+      count(*) as tot_cnt,
+      count({field}) as f_cnt,
+      count(*) - count({field}) as f_null_cnt,
+      round(100.0 * (count(*) - count({field})) / count(*), 1) as f_null_prct,
+      count(distinct {field}) as f_dstct_cnt,
+      round(100.0 * count(distinct {field}) / count(*), 1) as f_dstct_prct,
+      count(*) - count(distinct {field}) as f_dup_cnt
+    from "{schema}"."{table}"
+    group by {group_expr}
+
+  field_stat_len: |
+    -- field_stat_len {field}
+    select
+      '{schema}' as schema_nm,
+      '{table}' as table_nm,
+      '{field}' as field,
+      '{type}' as type,
+      count(*) as tot_cnt,
+      min(length({field})) as f_min_len,
+      max(length({field})) as f_max_len
+    from "{schema}"."{table}"
+
+  field_stat_deep: |
+    -- field_stat_deep {field}
+    select
+      '{schema}' as schema_nm,
+      '{table}' as table_nm,
+      '{field}' as field,
+      '{type}' as type,
+      count(*) as tot_cnt,
+      count({field}) as f_cnt,
+      count(*) - count({field}) as f_null_cnt,
+      round(100.0 * (count(*) - count({field})) / count(*), 1) as f_null_prct,
+      count(distinct {field}) as f_dstct_cnt,
+      round(100.0 * count(distinct {field}) / count(*), 1) as f_dstct_prct,
+      count(*) - count(distinct {field}) as f_dup_cnt,
+      cast(min({field}) as string) as f_min,
+      cast(max({field}) as string) as f_max,
+      min(length({field})) as f_min_len,
+      max(length({field})) as f_max_len
+    from "{schema}"."{table}"
+
+  fill_cnt_group_field: |
+    -- fill_cnt_group_field {field}
+    select
+      {field},
+      {columns_sql}
+    from "{schema}"."{table}"
+    group by {field}
+    order by {field}
+
+  fill_rate_group_field: |
+    -- fill_rate_group_field {field}
+    select
+      {field},
+      {fill_rate_fields_sql}
+    from "{schema}"."{table}"
+    group by {field}
+    order by {field}
+
+  distro_field: |
+    -- distro_field {field}
+    with t1 as (
+      select
+        '{field}' as field,
+        {field},
+        count(*) cnt
+      from "{schema}"."{table}"
+      group by {field}
+      order by count(*) desc
+    )
+    , t2 as (
+      select
+        '{field}' as field,
+        count(*) ttl_cnt
+      from "{schema}"."{table}"
+    )
+    select
+      '{table}' as table_nm,
+      t1.field,
+      {field} as value,
+      cnt,
+      round(100.0 * cnt / ttl_cnt, 2) as prct
+    from t1
+    join t2
+      on t1.field = t2.field
+    order by cnt desc
+
+  distro_field_group: |
+    -- distro_field_group {field}
+    with t1 as (
+      select
+        '{field}' as field,
+        {group_expr} as group_exp,
+        {field},        
+        count(*) cnt
+      from "{schema}"."{table}"
+      group by {field}, {group_expr}
+      order by count(*) desc
+    )
+    , t2 as (
+      select
+        '{field}' as field,
+        count(*) ttl_cnt
+      from "{schema}"."{table}"
+    )
+    select
+      '{table}' as table_nm,
+      t1.field,
+      t1.group_exp,
+      {field} as value,
+      cnt,
+      round(100.0 * cnt / ttl_cnt, 2) as prct
+    from t1
+    join t2
+      on t1.field = t2.field
+    order by cnt desc
+
+  distro_field_date: |
+    -- distro_field_date {field}
+    with t1 as (
+        select
+          '{field}' as field,
+          year({field}) as year,
+          month({field}) as month,
+          count(*) cnt
+        from "{schema}"."{table}"
+        group by year({field}), month({field})
+        order by year({field}), month({field})
+      )
+      , t2 as (
+        select '{field}' as field, count(*) ttl_cnt
+        from "{schema}"."{table}"
+      )
+      select 
+        '{schema}' as schema_nm,
+        '{table}' as table_nm,
+        t1.field,
+        t1.year,
+        t1.month,
+        cnt,
+        round(100.0 * cnt / ttl_cnt, 2) as prct
+      from t1
+      join t2
+        on t1.field = t2.field
+      order by t1.year, t1.month
+
+  distro_field_date_wide: |
+    -- distro_field_date {table}
+    select
+      '{date_field}' as date_field,
+      year({date_field}) as year,
+      month({date_field}) as month,
+      {columns_sql}
+    from "{schema}"."{table}"
+    {where_clause}
+    group by year({date_field}), month({date_field})
+    order by year({date_field}), month({date_field})
+
+  test_pk: |
+    select
+      '{schema}.{table}' as table_nm,
+      '{fields_exp}' as expression,
+      case when count(*) = count(distinct {fields_exp}) then 'PASS' else 'FAIL' end as pk_result,
+      count(*) as tot_cnt,
+      count(distinct {fields_exp}) as expression_cnt,
+      count(*) - count(distinct {fields_exp}) as delta_cnt,
+      sum(case when {fields_exp} is null then 1 else 0 end) as null_cnt
+    from "{schema}"."{table}"
+    {where_clause}
+
+routine:
+  number_min_max: |
+    select
+      count(*) as tot_cnt,
+      count({field}) as field_cnt,
+      min({field}) as min_val,
+      max({field}) as max_val
+    from "{schema}"."{table}"
+
+  number_trunc_min_max: |
+    select
+      {fields}
+    from "{schema}"."{table}"
+    where {where}
+      (({partition_col_trunc} >= '{min_val}'
+      and {partition_col_trunc} <= '{max_val}')
+      {or_null})
+
+  date_trunc_uniques: |
+    select
+      {partition_col_trunc} as day_field,
+      count(*) cnt
+    from "{schema}"."{table}"
+    {where}
+    group by {partition_col_trunc}
+    order by {partition_col_trunc}
+
+  number_trunc_uniques: |
+    select
+      {partition_col_trunc} as trunc_field,
+      count(*) cnt
+    from "{schema}"."{table}"
+    {where}
+    group by {partition_col_trunc}
+    order by {partition_col_trunc}
+
+function:
+  replace: replace({string_expr}, {to_replace}, {replacement})
+  str_utf8: '{ field }'
+  string_type: varchar
+  cast_as: cast({field} as {type})
+  cast_to_string: cast({field} as varchar)
+  cast_to_text: cast({field} as varchar)
+  fill_cnt_field: count({field}) as cnt_{field}
+  fill_rate_field: round(100.0 * count({field}) / count(*), 2) as prct_{field}
+  checksum_string: length({field})
+  checksum_json: length(replace({field}, ' ', ''))
+  checksum_integer: 'abs({field})'
+  checksum_decimal: 'abs(trunc({field}))'
+  checksum_datetime: '0'
+  checksum_boolean: 'length({field})'
+  now: current_timestamp
+  concat: 'concat({fields})'
+
+variable:
+  tmp_folder: /tmp
+  quote_char: '"'
+  bind_string: ${i}
+  ddl_col: 0
+  batch_rows: 2000
+  batch_values: 2000
+  date_layout_str: "'{value}'"
+  date_layout: '2006-01-02'
+  timestamp_layout_str: "'{value}'"
+  timestampz_layout_str: "'{value}'"
+  timestamp_layout: '2006-01-02 15:04:05.000000'
+  timestampz_layout: '2006-01-02 15:04:05.000000 -0700'
+  error_filter_table_exists: already
+  bool_as: bool
+  
+  # default merge strategy (can be overridden by database-specific templates)
+  default_merge_strategy: update_insert
+
+error_filter:
+  table_not_exist: exist
+
+# Default native type mappings (native_type -> general_type)
+# Individual databases override these as needed
+native_type_map:
+  # Integer types
+  bigint: bigint
+  int: integer
+  int2: smallint
+  int4: integer
+  int8: bigint
+  integer: integer
+  mediumint: integer
+  smallint: smallint
+  tinyint: smallint
+
+  # Floating point types
+  double: float
+  "double precision": float
+  float: float
+  float4: float
+  float8: float
+  real: float
+
+  # Decimal/Numeric types
+  decimal: decimal
+  fixed: decimal
+  money: decimal
+  number: decimal
+  numeric: decimal
+
+  # String types
+  bpchar: string
+  char: string
+  character: string
+  "character varying": text
+  longtext: text
+  mediumtext: text
+  nchar: text
+  ntext: text
+  nvarchar: text
+  string: text
+  text: text
+  tinytext: text
+  varchar: text
+
+  # Binary types
+  binary: binary
+  bit: binary
+  blob: binary
+  bytea: binary
+  image: binary
+  longblob: binary
+  mediumblob: binary
+  tinyblob: binary
+  varbinary: binary
+
+  # Boolean types
+  bool: bool
+  boolean: bool
+
+  # Date/Time types
+  date: date
+  datetime: datetime
+  datetime2: datetime
+  smalldatetime: datetime
+  time: time
+  "time with time zone": timez
+  "time without time zone": time
+  timestamp: timestamp
+  "timestamp with time zone": timestampz
+  "timestamp without time zone": timestamp
+  timestamptz: timestampz
+  timetz: timez
+
+  # JSON types
+  json: json
+  jsonb: json
+
+  # UUID type
+  uuid: uuid
+
+  # Array/Complex types (default to json)
+  array: json
+  list: json
+  map: json
+  object: json
+  struct: json
+  variant: json
+
+general_type_map:
+  bigint: bigint
+  binary: bytea
+  bool: bool
+  date: date
+  datetime: timestamp
+  decimal: numeric
+  float: "double precision"
+  integer: integer
+  json: jsonb
+  smallint: smallint
+  string: "varchar()"
+  text: text
+  time: "time(6)"
+  timestamp: timestamp
+  timestampz: timestamptz
+  timez: "time with time zone"
+  uuid: uuid

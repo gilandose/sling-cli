@@ -1,0 +1,11 @@
+source: OCRAL_R2
+target: SQLITE
+
+defaults:
+  mode: full-refresh
+  object: 'main.do_{stream_file_name}'
+
+streams:
+  s3://ocral/test.fs.write/*:
+  s3://ocral/test.fs.write/*.csv:
+    single: true

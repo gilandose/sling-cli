@@ -1,0 +1,777 @@
+core:
+  drop_table: drop table if exists {table}
+  drop_view: drop view if exists {view}
+  drop_index: drop index if exists {schema}.{index}
+  create_schema: create schema if not exists {schema}
+  create_table: create table if not exists {table} ({col_types}) {partition_by}
+  create_index: create index if not exists {index} on {table} ({cols})
+  create_unique_index: create unique index if not exists {index} on {table} ({cols})
+  create_index_full: create {unique} index if not exists {index} on {table} {using} ({cols}) {include} {where}
+  replace: insert into {table} ({fields}) values ({values}) on conflict ({pk_fields}) do update set {set_fields}
+  replace_temp: |
+    insert into {table} ({names})
+    select {names} from {temp_table}
+    on conflict ({pk_fields}) do nothing;
+    update {table} as t1 set {set_fields2}
+    from (select * from {temp_table}) as t2
+    where {pk_fields_equal}
+  insert: insert into {table} ({fields}) values ({values})
+  insert_temp: insert into {table} ({fields}) select {cols} from {temp_table}
+  insert_ignore: insert into {table} ({fields}) values ({values}) on conflict ({pk_fields}) do nothing
+  insert_ignore_temp: insert into {table} ({names}) select {names} from {temp_table} on conflict ({pk_fields}) do nothing
+  update_temp: |
+    update {table} as t1 set {set_fields2}
+    from (select * from {temp_table}) as t2
+    where {pk_fields_equal2}
+  sample: select {fields} from {table} TABLESAMPLE SYSTEM (50) limit {n}
+  rename_table: ALTER TABLE {table} RENAME TO {new_table}
+  modify_column: alter column {column} type {type}
+
+  # Foreign key DDL template
+  add_foreign_key: |
+    ALTER TABLE {table} ADD CONSTRAINT {constraint} FOREIGN KEY ({column}) REFERENCES {ref_table}({ref_column}){on_delete}{on_update}
+
+  # Column comment/description template
+  add_column_comment: COMMENT ON COLUMN {table}."{column}" IS {comment}
+
+  # Table comment/description template
+  add_table_comment: COMMENT ON TABLE {table} IS {comment}
+
+  use_database: SET search_path TO {database}
+  
+  # in order to use on conflict, the target table needs
+  #  a unique index on the PK. We will not use it since
+  # it complicates matters
+  # merge_update_insert: |
+  #   {final_table_index_sql};
+  #   insert into {tgt_table}
+  #   ({insert_fields})
+  #   select {src_fields} from {src_table} src
+  #   on conflict ({tgt_pk_fields})
+  #   do update 
+  #   SET {set_fields}
+    
+  merge_insert: |
+    INSERT INTO {tgt_table} ({insert_fields})
+    SELECT {src_fields} FROM {src_table} src
+    WHERE NOT EXISTS (
+      SELECT 1 FROM {tgt_table} tgt WHERE {src_tgt_pk_equal}
+    )
+
+  merge_update: |
+    UPDATE {tgt_table} tgt
+    SET {set_fields}
+    FROM {src_table} src
+    WHERE {src_tgt_pk_equal}
+
+  merge_update_insert: |
+    create temporary table {temp_table} as
+    with src_table as (
+      select {src_fields} from {src_table}
+    )
+    , updates as (
+      update {tgt_table} tgt
+      set {set_fields}
+      from src_table src
+      where {src_tgt_pk_equal}
+      returning tgt.*
+    )
+    select * from updates;
+
+    {temp_table_index_sql};
+
+    with src_table as (
+      select {src_fields} from {src_table}
+    )
+    insert into {tgt_table}
+    ({insert_fields})
+    select {src_fields} from src_table src
+    where not exists (
+      select 1
+      from {temp_table} upd
+      where {src_upd_pk_equal}
+    )
+
+  merge_delete_insert: |
+    DELETE FROM {tgt_table} tgt
+    WHERE EXISTS (
+      SELECT 1 FROM {src_table} src
+      WHERE {src_tgt_pk_equal}
+    );
+    INSERT INTO {tgt_table} ({insert_fields})
+    SELECT {src_fields} FROM {src_table} src
+
+  merge_change_capture: |
+    DELETE FROM {tgt_table} tgt
+    WHERE EXISTS (
+      SELECT 1 FROM (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
+        FROM {src_table}
+      ) src
+      WHERE src._rn = 1 AND src._sling_synced_op = 'D'
+      AND {src_tgt_pk_equal}
+    );
+    create temporary table {temp_table} as
+    with cdc_latest as (
+      select *, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
+      from {src_table}
+      where _sling_synced_op != 'D'
+    )
+    , src_table as (
+      select {src_fields} from cdc_latest where _rn = 1
+    )
+    , updates as (
+      update {tgt_table} tgt
+      set {set_fields}
+      from src_table src
+      where {src_tgt_pk_equal}
+      returning tgt.*
+    )
+    select * from updates;
+    {temp_table_index_sql};
+    with cdc_latest as (
+      select *, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
+      from {src_table}
+      where _sling_synced_op != 'D'
+    )
+    , cdc_deleted as (
+      select {pk_fields} from (
+        select {pk_fields}, _sling_synced_op, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
+        from {src_table}
+      ) t where _rn = 1 AND _sling_synced_op = 'D'
+    )
+    , src_table as (
+      select {src_fields} from cdc_latest where _rn = 1
+    )
+    insert into {tgt_table}
+    ({insert_fields})
+    select {src_fields} from src_table src
+    where not exists (
+      select 1
+      from {temp_table} upd
+      where {src_upd_pk_equal}
+    )
+    and not exists (
+      select 1
+      from cdc_deleted del
+      where {src_del_pk_equal}
+    )
+
+  merge_change_capture_soft: |
+    UPDATE {tgt_table} tgt SET _sling_synced_at = CURRENT_TIMESTAMP, _sling_synced_op = 'D'
+    FROM (
+      SELECT *, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
+      FROM {src_table}
+    ) src
+    WHERE src._rn = 1 AND src._sling_synced_op = 'D'
+    AND {src_tgt_pk_equal}
+    AND tgt._sling_synced_op != 'D';
+    create temporary table {temp_table} as
+    with cdc_latest as (
+      select *, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
+      from {src_table}
+      where _sling_synced_op != 'D'
+    )
+    , src_table as (
+      select {src_fields} from cdc_latest where _rn = 1
+    )
+    , updates as (
+      update {tgt_table} tgt
+      set {set_fields}
+      from src_table src
+      where {src_tgt_pk_equal}
+      returning tgt.*
+    )
+    select * from updates;
+    {temp_table_index_sql};
+    with cdc_latest as (
+      select *, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
+      from {src_table}
+      where _sling_synced_op != 'D'
+    )
+    , cdc_deleted as (
+      select {pk_fields} from (
+        select {pk_fields}, _sling_synced_op, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
+        from {src_table}
+      ) t where _rn = 1 AND _sling_synced_op = 'D'
+    )
+    , src_table as (
+      select {src_fields} from cdc_latest where _rn = 1
+    )
+    insert into {tgt_table}
+    ({insert_fields})
+    select {src_fields} from src_table src
+    where not exists (
+      select 1
+      from {temp_table} upd
+      where {src_upd_pk_equal}
+    )
+    and not exists (
+      select 1
+      from cdc_deleted del
+      where {src_del_pk_equal}
+    )
+
+metadata:
+
+  current_database:
+    select current_database()
+    
+  databases: |
+    select datname as name from pg_database
+
+  schemas: |
+    select schema_name
+    from information_schema.schemata
+    where catalog_name = ( select current_catalog )
+    order by schema_name
+
+  tables: |
+    select table_schema as schema_name, table_name, 'false' as is_view
+    from information_schema.tables
+    where table_type = 'BASE TABLE'
+      and table_catalog = ( select current_catalog )
+      {{if .schema -}} and table_schema = '{schema}' {{- end}}
+    order by table_name
+
+  views: |
+    select * from (
+      select table_schema as schema_name, table_name, 'true' as is_view
+      from information_schema.tables
+      where table_type in ('VIEW', 'FOREIGN')
+        and table_catalog = ( select current_catalog )
+        {{if .schema -}} and table_schema = '{schema}' {{- end}}
+      
+      union
+
+      select schemaname as table_schema, matviewname as table_name, 'true' as is_view
+      from pg_catalog.pg_matviews
+      {{if .schema -}} where schemaname = '{schema}' {{- end}}
+    ) t
+    order by table_name
+
+  columns: |
+    SELECT
+      pg_attribute.attname AS column_name,
+      pg_catalog.format_type(pg_attribute.atttypid, pg_attribute.atttypmod) as data_type,
+      CASE pg_attribute.atttypid
+        WHEN 21 /*int2*/ THEN 16
+        WHEN 23 /*int4*/ THEN 32
+        WHEN 20 /*int8*/ THEN 64
+        WHEN 1700 /*numeric*/ THEN
+            CASE WHEN pg_attribute.atttypmod = -1
+                  THEN null
+                  ELSE ((pg_attribute.atttypmod - 4) >> 16) & 65535     -- calculate the precision
+                  END
+        WHEN 700 /*float4*/ THEN 24 /*FLT_MANT_DIG*/
+        WHEN 701 /*float8*/ THEN 53 /*DBL_MANT_DIG*/
+        ELSE null
+      END AS precision,
+      CASE 
+        WHEN pg_attribute.atttypid IN (21, 23, 20) THEN 0
+        WHEN pg_attribute.atttypid IN (1700) THEN            
+            CASE 
+                WHEN pg_attribute.atttypmod = -1 THEN null       
+                ELSE (pg_attribute.atttypmod - 4) & 65535            -- calculate the scale  
+            END
+          ELSE null
+      END AS scale
+    from pg_catalog.pg_class
+    INNER JOIN pg_catalog.pg_namespace ON pg_class.relnamespace = pg_namespace.oid
+    INNER JOIN pg_catalog.pg_attribute ON pg_class.oid = pg_attribute.attrelid
+    where 1=1
+      and pg_class.relkind in ('r', 'v', 'm', 'f', 'p')
+      and pg_namespace.nspname = '{schema}'
+      and pg_class.relname = '{table}'
+      and pg_attribute.attnum >= 1
+      and not pg_attribute.attisdropped
+    ORDER BY pg_attribute.attnum
+
+  primary_keys: |
+    select tco.constraint_name as pk_name,
+           kcu.ordinal_position as position,
+           kcu.column_name as column_name
+    from information_schema.table_constraints tco
+    join information_schema.key_column_usage kcu 
+         on kcu.constraint_name = tco.constraint_name
+         and kcu.constraint_schema = tco.constraint_schema
+         and kcu.constraint_name = tco.constraint_name
+    where kcu.table_schema = '{schema}'
+      and kcu.table_name = '{table}'
+    order by kcu.table_schema,
+             kcu.table_name,
+             position
+
+  indexes: |
+    select
+      i.relname as index_name,
+      a.attname as column_name
+    from
+      pg_class t,
+      pg_class i,
+      pg_index ix,
+      pg_attribute a,
+      pg_namespace n
+    where
+      t.oid = ix.indrelid
+      and i.oid = ix.indexrelid
+      and n.oid = i.relnamespace
+      and a.attrelid = t.oid
+      and a.attnum = ANY(ix.indkey)
+      and n.nspname = '{schema}' and t.relname = '{table}'
+    order by
+      t.relname,
+      i.relname
+
+  # Extended column attributes for schema migration
+  columns_extended: |
+    SELECT
+      c.column_name,
+      CASE WHEN c.is_nullable = 'YES' THEN 'true' ELSE 'false' END AS is_nullable,
+      c.column_default AS default_value,
+      CASE
+        WHEN a.attidentity IN ('a', 'd') THEN 'true'
+        WHEN c.column_default LIKE 'nextval%' THEN 'true'
+        ELSE 'false'
+      END AS is_auto_increment,
+      COALESCE(seq.seqstart::text, '1') AS identity_seed,
+      COALESCE(seq.seqincrement::text, '1') AS identity_increment,
+      CASE WHEN pk.conname IS NOT NULL THEN 'true' ELSE 'false' END AS is_primary_key,
+      pd.description
+    FROM information_schema.columns c
+    JOIN pg_catalog.pg_namespace n ON n.nspname = c.table_schema
+    JOIN pg_catalog.pg_class t ON t.relnamespace = n.oid AND t.relname = c.table_name
+    JOIN pg_catalog.pg_attribute a ON a.attrelid = t.oid AND a.attname = c.column_name
+    LEFT JOIN pg_catalog.pg_depend dep ON dep.refobjid = t.oid AND dep.refobjsubid = a.attnum
+    LEFT JOIN pg_catalog.pg_class seq_class ON seq_class.oid = dep.objid AND seq_class.relkind = 'S'
+    LEFT JOIN pg_catalog.pg_sequence seq ON seq.seqrelid = seq_class.oid
+    LEFT JOIN pg_catalog.pg_description pd ON pd.objoid = t.oid AND pd.objsubid = a.attnum
+    LEFT JOIN (
+      SELECT con.conname, unnest(con.conkey) as attnum, con.conrelid
+      FROM pg_catalog.pg_constraint con
+      WHERE con.contype = 'p'
+    ) pk ON pk.conrelid = t.oid AND pk.attnum = a.attnum
+    WHERE c.table_schema = '{schema}' AND c.table_name = '{table}'
+    ORDER BY c.ordinal_position
+
+  # Foreign key relationships
+  foreign_keys: |
+    SELECT
+      tc.constraint_name,
+      kcu.column_name,
+      ccu.table_schema AS referenced_schema,
+      ccu.table_name AS referenced_table,
+      ccu.column_name AS referenced_column,
+      rc.delete_rule AS on_delete,
+      rc.update_rule AS on_update
+    FROM information_schema.table_constraints tc
+    JOIN information_schema.key_column_usage kcu
+      ON tc.constraint_name = kcu.constraint_name
+      AND tc.table_schema = kcu.table_schema
+    JOIN information_schema.constraint_column_usage ccu
+      ON ccu.constraint_name = tc.constraint_name
+      AND ccu.table_schema = tc.table_schema
+    JOIN information_schema.referential_constraints rc
+      ON rc.constraint_name = tc.constraint_name
+      AND rc.constraint_schema = tc.constraint_schema
+    WHERE tc.constraint_type = 'FOREIGN KEY'
+      AND tc.table_schema = '{schema}'
+      AND tc.table_name = '{table}'
+    ORDER BY tc.constraint_name, kcu.ordinal_position
+
+  # Extended table attributes for schema migration
+  table_extended: |
+    SELECT
+      obj_description(c.oid, 'pg_class') AS description
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = '{schema}' AND c.relname = '{table}'
+
+  columns_full: |
+    select
+      s.nspname as schema_name,
+      t.relname as table_name,
+      a.attname as column_name,
+      pg_catalog.format_type(a.atttypid, a.atttypmod) as data_type,
+      a.attnum as position
+    from pg_attribute a
+      join pg_class t on a.attrelid = t.oid
+      join pg_namespace s on t.relnamespace = s.oid
+    where a.attnum > 0 
+      and not a.attisdropped
+      and t.relkind in ('r', 'v', 'm', 'f', 'p')
+      {{if .schema -}} and s.nspname = '{schema}' {{- end}}
+      {{if .table -}} and t.relname = '{table}' {{- end}}
+    order by s.nspname, t.relname, a.attnum
+
+  schemata: |
+    select
+      s.nspname as schema_name,
+      t.relname as table_name,
+      case t.relkind
+        when 'r' then false
+        else true
+      end as is_view,
+      a.attname as column_name,
+      pg_catalog.format_type(a.atttypid, a.atttypmod) as data_type,
+      a.attnum as position
+    from pg_attribute a
+      join pg_class t on a.attrelid = t.oid
+      join pg_namespace s on t.relnamespace = s.oid
+    where a.attnum > 0 
+      and not a.attisdropped
+      and t.relkind in ('r', 'v', 'm', 'f', 'p')
+      {{if .schema -}} and s.nspname = '{schema}' {{- end}}
+      {{if .tables -}} and t.relname in ({tables}) {{- end}}
+    order by s.nspname, t.relname, a.attnum
+  
+  row_count_estimates: |
+    select 
+      nspname as schema_name,
+      relname as table_name,
+      reltuples as count
+    from pg_class c
+    left join pg_namespace n on (n.oid = c.relnamespace)
+    where nspname not in ('pg_catalog', 'information_schema', '_timescaledb_internal')
+      and relkind in ('r', 'v', 'm', 'f', 'p')
+      {{if .schema -}} and nspname = '{schema}' {{- end}}
+      {{if .table -}} and relnam = '{table}' {{- end}}
+    order by reltuples desc
+
+  ddl_table: "
+    with tabledefinition as (
+    SELECT
+    n.nspname, c.relname, a.attname AS column_name,
+    pg_catalog.format_type(a.atttypid, a.atttypmod) as type,
+    case
+    when a.attnotnull
+    then 'NOT NULL'
+    else 'NULL'
+    END as not_null
+    from pg_class c,
+    pg_attribute a,
+    pg_type t,
+    pg_namespace n
+    where  n.nspname = '{schema}' and c.relname = '{table}'
+    AND a.attnum > 0
+    AND a.attrelid = c.oid
+    AND a.atttypid = t.oid
+    and  n.oid = c.relnamespace
+    ORDER BY a.attnum
+    )
+    , table_ddl as (
+    SELECT
+    'CREATE TABLE ' || nspname || '.' || relname || E'\n(\n' ||
+    array_to_string(
+    array_agg(
+    '    \"' || column_name || '\" ' ||  type || ' '|| not_null
+    )
+    , E',\n'
+    ) || E'\n)' as ddl
+    from tabledefinition
+    group by nspname, relname
+    )
+    select
+    table_ddl.ddl as ddl
+    from table_ddl
+    "
+  ddl_view: |
+    select pg_get_viewdef(to_regclass('"{schema}"."{table}"'))::text as ddl
+
+  sessions: select *
+    from pg_stat_activity
+    where state = 'active'
+
+  session_terminate: select pg_terminate_backend({pid})
+
+analysis:
+  field_chars: |
+    select
+      '{schema}' as schema_nm,
+      '{table}' as table_nm,
+      '{field}' as field, sum(case when {field}::text ~ '\n' then 1 else 0 end) as cnt_nline, 
+      sum(case when {field}::text ~ '\t' then 1 else 0 end) as cnt_tab, 
+      sum(case when {field}::text ~ ',' then 1 else 0 end) as cnt_comma, 
+      sum(case when {field}::text ~ '"' then 1 else 0 end) as cnt_dquote, 
+      min(length({field}::text)) as f_min_len, 
+      max(length({field}::text)) as f_max_len
+    from "{schema}"."{table}"
+
+  field_stat_len: |
+    -- field_stat_len {field}
+    select
+      '{schema}' as schema_nm,
+      '{table}' as table_nm,
+      '{field}' as field,
+      count(*) as tot_cnt,
+      -- max(length(abs(({field} - round({field},0)))::text)-2) as f_max_dec_len,
+      min(length({field}::text)) as f_min_len,
+      max(length({field}::text)) as f_max_len
+    from "{schema}"."{table}"
+
+  field_stat_deep: |
+    select
+      '{schema}' as schema_nm,
+      '{table}' as table_nm,
+      '{field}' as field,
+      count(*) as tot_cnt,
+      count({field}) as f_cnt,
+      count(*) - count({field}) as f_null_cnt,
+      round(100.0 * (count(*) - count({field})) / count(*),1) as f_null_prct,
+      count(distinct {field}) as f_dstct_cnt,
+      round(100.0 * count(distinct {field}) / count(*),1) as f_dstct_prct,
+      count(*) - count(distinct {field}) as f_dup_cnt,
+      min({field})::text as f_min,
+      max({field})::text as f_max,
+      min(length({field}::text)) as f_min_len,
+      max(length({field}::text)) as f_max_len
+    from "{schema}"."{table}"
+
+  distro_field: |
+    with t1 as (
+      select
+        '{field}'::text as field,
+        {field},
+        count(*) cnt
+      from "{schema}"."{table}"
+      group by {field}
+      order by count(*) desc
+    )
+    , t2 as (
+      select
+        '{field}'::text as field,
+        count(*) ttl_cnt
+      from "{schema}"."{table}"
+    )
+    select
+      '{table}' as table_nm,
+      t1.field,
+      {field} as value,
+      cnt,
+      round(100.0 * cnt / ttl_cnt, 2) as prct
+    from t1
+    join t2
+      on t1.field = t2.field
+    order by cnt desc
+
+  distro_field_group: |
+    with t1 as (
+      select
+        '{field}'::text as field,
+        {group_expr} as group_exp,
+        {field},        
+        count(*) cnt
+      from "{schema}"."{table}"
+      group by {field}, {group_expr}
+      order by count(*) desc
+    )
+    , t2 as (
+      select
+        '{field}'::text as field,
+        count(*) ttl_cnt
+      from "{schema}"."{table}"
+    )
+    select
+      '{table}' as table_nm,
+      t1.field,
+      t1.group_exp,
+      {field} as value,
+      cnt,
+      round(100.0 * cnt / ttl_cnt, 2) as prct
+    from t1
+    join t2
+      on t1.field = t2.field
+    order by cnt desc
+
+  distro_field_date: |
+    with t1 as (
+        select
+          '{field}'::text as field,
+          extract(year from {field}) as year,
+          extract(month from {field}) as month,
+          extract(day from {field}) as day,
+          count(*) cnt
+        from "{schema}"."{table}"
+        group by 2, 3, 4
+        order by 2, 3, 4
+      )
+      , t2 as (
+        select '{field}'::text as field, count(*) ttl_cnt
+        from "{schema}"."{table}"
+      )
+      select 
+        '{schema}' as schema_nm,
+        '{table}' as table_nm,
+        t1.field,
+        t1.year,
+        t1.month,
+        t1.day,
+        cnt,
+        round(100.0 * cnt / ttl_cnt, 2) as prct
+      from t1
+      join t2
+        on t1.field = t2.field
+      order by t1.year, t1.month, t1.day
+
+function:
+  truncate_f: trunc({field})
+  truncate_datef: trunc({field})
+  string_type: text
+  cast_to_string: '{field}::text'
+  cast_to_text: '{field}::text'
+  date_to_int: trunc(extract(epoch from {field})/(60*60*24))::int
+  number_to_int: round({field}, 0)
+  sleep: select pg_sleep({seconds})
+  checksum_datetime: (date_part('epoch', {field}) * 1000000)::bigint
+  checksum_string: length({field}::text)
+  checksum_boolean: length({field}::text)
+  checksum_json: length(replace({field}::text, ' ', ''))
+  now: current_timestamp
+
+variable:
+  tmp_folder: /tmp
+  bind_string: ${c}
+  error_filter_table_exists: already exists
+  max_string_type: varchar(65500)
+  max_string_length: 65500
+  max_column_length: 63
+
+native_type_map:
+  "char": string
+  '"char"[]': json
+  "_uuid": text
+  'aclitem[]': json
+  anyarray: json
+  bigint: bigint
+  bigserial: bigint
+  bit: bool
+  "bit varying": string
+  bool: bool
+  boolean: bool
+  'boolean[]': json
+  box: string
+  bpchar: string
+  bytea: binary
+  character: string
+  "character varying": text
+  cidr: string
+  circle: string
+  date: date
+  decimal: decimal
+  "double precision": float
+  "double precision[]": json
+  float4: float
+  float8: float
+  inet: string
+  information_schema.cardinal_number: integer
+  information_schema.character_data: string
+  information_schema.sql_identifier: string
+  information_schema.time_stamp: string
+  information_schema.yes_or_no: string
+  int: integer
+  int2: smallint
+  int2vector: string
+  int4: integer
+  int8: bigint
+  integer: integer
+  interval: string
+  json: json
+  jsonb: json
+  line: string
+  lseg: string
+  macaddr: string
+  money: decimal
+  name: string
+  'name[]': json
+  numeric: decimal
+  oid: string
+  'oid[]': json
+  oidvector: string
+  path: string
+  pg_dependencies: string
+  pg_lsn: bigint
+  pg_mcv_list: string
+  pg_ndistinct: string
+  pg_node_tree: string
+  'pg_statistic[]': json
+  point: string
+  polygon: string
+  real: float
+  'real[]': json
+  regproc: string
+  regtype: string
+  'regtype[]': json
+  serial: integer
+  serial2: smallint
+  serial4: integer
+  serial8: integer
+  smallint: smallint
+  'smallint[]': json
+  smallserial: smallint
+  text: text
+  'text[]': json
+  time: time
+  "time with time zone": timez
+  "time without time zone": time
+  timestamp: timestamp
+  "timestamp with time zone": timestampz
+  "timestamp without time zone": timestamp
+  timestamptz: timestampz
+  timetz: timez
+  tsquery: string
+  tsvector: string
+  txid_snapshot: string
+  uuid: uuid
+  varbit: string
+  varchar: text
+  xid: string
+  xml: string
+  geometry: geometry
+  geography: geometry
+
+
+general_type_map:
+  bigint: bigint
+  binary: bytea
+  bool: bool
+  date: date
+  datetime: timestamp
+  decimal: numeric
+  float: "double precision"
+  geometry: geometry
+  integer: integer
+  json: jsonb
+  smallint: smallint
+  string: "varchar()"
+  text: text
+  time: "time(6)"
+  timestamp: timestamp
+  timestampz: timestamptz
+  timez: "time with time zone"
+  uuid: uuid
+
+# Schema migration: default value translation between native and generalized forms
+default_value_map:
+  to_general:
+    "CURRENT_TIMESTAMP": "current_timestamp"
+    "now()": "current_timestamp"
+    "NOW()": "current_timestamp"
+    "CURRENT_DATE": "current_date"
+    "current_date": "current_date"
+    "CURRENT_TIME": "current_time"
+    "current_time": "current_time"
+    "gen_random_uuid()": "uuid()"
+    "uuid_generate_v4()": "uuid()"
+    "true": "true"
+    "false": "false"
+    "'t'::boolean": "true"
+    "'f'::boolean": "false"
+  from_general:
+    "current_timestamp": "CURRENT_TIMESTAMP"
+    "current_timestamp_utc": "CURRENT_TIMESTAMP AT TIME ZONE 'UTC'"
+    "current_date": "CURRENT_DATE"
+    "current_time": "CURRENT_TIME"
+    "uuid()": "gen_random_uuid()"
+    "true": "true"
+    "false": "false"
+    "null": "NULL"

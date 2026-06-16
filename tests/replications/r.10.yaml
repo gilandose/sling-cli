@@ -1,0 +1,13 @@
+source: aws_s3
+target: sftp
+
+defaults:
+  mode: full-refresh
+
+streams:
+  test/parquet/*.parquet:
+    object: test/parquet/aws_s3.text
+    target_options:
+      format: csv
+env:
+  SLING_DUCKDB_COMPUTE: false

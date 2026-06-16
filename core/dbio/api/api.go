@@ -1,0 +1,1023 @@
+package api
+
+import (
+	"context"
+	"net/http"
+	"os"
+	"regexp"
+	"strings"
+	"sync"
+
+	"github.com/flarco/g"
+	"github.com/jmespath/go-jmespath"
+	"github.com/slingdata-io/sling-cli/core/dbio/iop"
+	"github.com/spf13/cast"
+)
+
+type APIConnection struct {
+	Name          string
+	Spec          Spec
+	State         *APIState
+	Context       *g.Context
+	evaluator     *iop.Evaluator `json:"-" yaml:"-"`
+	evaluatorSafe *iop.Evaluator `json:"-" yaml:"-"`
+}
+
+// NewAPIConnection creates an
+func NewAPIConnection(ctx context.Context, spec Spec, data map[string]any) (ac *APIConnection, err error) {
+
+	ac = &APIConnection{
+		Name:    cast.ToString(data["name"]),
+		Context: g.NewContext(ctx),
+		State: &APIState{
+			Env:    g.KVArrToMap(os.Environ()...),
+			State:  g.M(),
+			Queues: make(map[string]*iop.Queue),
+			Auth:   APIStateAuth{Mutex: &sync.Mutex{}},
+		},
+		Spec:          spec,
+		evaluator:     iop.NewEvaluator(g.ArrStr("env", "state", "secrets", "inputs", "auth", "response", "request", "sync", "context")),
+		evaluatorSafe: iop.NewEvaluator(g.ArrStr("env", "state", "secrets", "inputs", "auth", "response", "request", "sync", "context")),
+	}
+
+	ac.evaluatorSafe.KeepMissingExpr = true
+
+	if ac.Name == "" {
+		// use normalized spec name
+		ac.Name = strings.ReplaceAll(strings.ToLower(strings.TrimSpace(spec.Name)), " ", "_")
+	}
+
+	// Merge spec defaults state into ac.State.State first
+	if len(spec.Defaults.State) > 0 {
+		for k, v := range spec.Defaults.State {
+			ac.State.State[k] = v
+		}
+	}
+
+	// load state / secrets from data (these override defaults)
+	if state, ok := data["state"]; ok {
+		var stateMap map[string]any
+		if err = g.JSONConvert(state, &stateMap); err != nil {
+			return ac, g.Error(err)
+		}
+		// Merge into existing state (overriding defaults)
+		for k, v := range stateMap {
+			ac.State.State[k] = v
+		}
+	}
+	if secrets, ok := data["secrets"]; ok {
+		if err = g.JSONConvert(secrets, &ac.State.Secrets); err != nil {
+			return ac, g.Error(err)
+		}
+	}
+
+	if inputs, ok := data["inputs"]; ok {
+		if err = g.JSONConvert(inputs, &ac.State.Inputs); err != nil {
+			return ac, g.Error(err)
+		}
+	}
+
+	// set endpoint contexts
+	for key, endpoint := range ac.Spec.EndpointMap {
+		endpoint.context = g.NewContext(ac.Context.Ctx)
+		endpoint.auth = APIStateAuth{Mutex: &sync.Mutex{}}
+		ac.Spec.EndpointMap[key] = endpoint
+	}
+
+	return ac, nil
+}
+
+func (ac *APIConnection) GetReplicationStore() (store map[string]any) {
+	err := g.JSONConvert(ac.State.Store, &store)
+	if err != nil {
+		g.Warn("could not unmarshal from API state replication store: " + err.Error())
+	}
+
+	if store == nil {
+		store = g.M()
+	}
+	return store
+}
+
+func (ac *APIConnection) SetReplicationStore(store map[string]any) {
+	if store == nil {
+		store = g.M()
+	}
+	ac.State.Store = store
+}
+
+// Close performs cleanup of all resources
+func (ac *APIConnection) Close() error {
+	ac.CloseAllQueues()
+	return nil
+}
+
+func (ac *APIConnection) ListEndpoints(patterns ...string) (endpoints Endpoints, err error) {
+
+	// Render dynamic endpoints if needed
+	if err := ac.RenderDynamicEndpoints(); err != nil {
+		return nil, g.Error(err, "failed to render dynamic endpoints")
+	}
+
+	// Determine whether a specific pattern was requested. Without a pattern (or
+	// with a "*" pattern), broad enumeration callers (sling conns discover,
+	// replication wildcard expansion) should not surface queue_only endpoints
+	// because they produce no record stream. Explicit pattern lookups still
+	// return them so consumers can name them and dependency resolution finds them.
+	broadEnum := len(patterns) == 0 || patterns[0] == "" || patterns[0] == "*"
+
+	// Collect all endpoints (static + dynamically generated)
+	for _, endpointName := range ac.Spec.endpointsOrdered {
+		endpoint := ac.Spec.EndpointMap[endpointName]
+		if endpoint.Disabled {
+			continue
+		} else if endpoint.QueueOnly && broadEnum {
+			continue
+		}
+		endpoints = append(endpoints, endpoint)
+	}
+
+	// fill DependsOn
+	for i, ep := range endpoints {
+		if len(ep.DependsOn) == 0 {
+			ep.DependsOn = endpoints.HasUpstreams(ep.Name)
+		}
+		endpoints[i] = ep
+	}
+
+	// Filter by pattern if provided
+	if len(patterns) > 0 && patterns[0] != "" {
+		pattern := patterns[0]
+		filterEndpoints := Endpoints{}
+		for _, endpoint := range endpoints {
+			if g.IsMatched([]string{pattern}, endpoint.Name) {
+				filterEndpoints = append(filterEndpoints, endpoint)
+			}
+		}
+		endpoints = filterEndpoints
+	}
+
+	endpoints.Sort()
+
+	return endpoints, nil
+}
+
+// GetTestEndpoint returns the best endpoint for testing connectivity/authentication.
+// Ranking: (1) non-incremental with auth, (2) incremental with auth, (3) non-incremental, (4) first endpoint
+func (ac *APIConnection) GetTestEndpoint() string {
+	endpoints, err := ac.ListEndpoints()
+	if err != nil || len(endpoints) == 0 {
+		return ""
+	}
+
+	hasSpecAuth := ac.Spec.Authentication.Type() != AuthTypeNone
+
+	var nonIncrementalWithAuth, incrementalWithAuth, nonIncremental string
+
+	for _, ep := range endpoints {
+		// Determine if incremental (has sync values or update key)
+		isIncremental := len(ep.Sync) > 0 || ep.Response.Records.UpdateKey != ""
+
+		// Determine if has auth (spec-level or endpoint-level)
+		hasAuth := hasSpecAuth || ep.Authentication != nil
+
+		if !isIncremental && hasAuth && nonIncrementalWithAuth == "" {
+			nonIncrementalWithAuth = ep.Name
+		} else if isIncremental && hasAuth && incrementalWithAuth == "" {
+			incrementalWithAuth = ep.Name
+		} else if !isIncremental && nonIncremental == "" {
+			nonIncremental = ep.Name
+		}
+	}
+
+	// Return by priority
+	if nonIncrementalWithAuth != "" {
+		return nonIncrementalWithAuth
+	}
+	if incrementalWithAuth != "" {
+		return incrementalWithAuth
+	}
+	if nonIncremental != "" {
+		return nonIncremental
+	}
+
+	// Fallback: first endpoint (already sorted alphabetically)
+	return endpoints[0].Name
+}
+
+// compile all spec endpoints
+func (ac *APIConnection) CompileEndpoints() (compiledEndpoints Endpoints, err error) {
+	// render dynamic endpoint if needed
+	if err = ac.RenderDynamicEndpoints(); err != nil {
+		return nil, g.Error(err, "could not render dynamic endpoints for compilation")
+	}
+
+	compiledEndpoints = Endpoints{}
+	for _, name := range ac.Spec.endpointsOrdered {
+		endpoint := ac.Spec.EndpointMap[name]
+		endpoint.conn = ac
+		if err = compileSpecEndpoint(&endpoint, ac.Spec); err != nil {
+			return compiledEndpoints, g.Error(err, "endpoint compilation failed")
+		}
+
+		compiledEndpoints = append(compiledEndpoints, endpoint)
+	}
+
+	return
+}
+
+type APIStreamConfig struct {
+	Flatten     int // levels of flattening. 0 is infinite
+	JmesPath    string
+	Jq          string
+	Select      []string // select specific columns
+	PrimaryKey  []string
+	Limit       int
+	Metadata    iop.Metadata
+	Mode        string
+	Range       string
+	DsConfigMap map[string]any // stream processor options
+	SchemaOnly  bool
+}
+
+func (ac *APIConnection) ReadDataflow(endpointName string, sCfg APIStreamConfig) (df *iop.Dataflow, err error) {
+
+	// render dynamic endpoint if needed
+	if err = ac.RenderDynamicEndpoints(); err != nil {
+		return nil, g.Error(err, "could not render dynamic endpoints")
+	}
+
+	// get endpoint, match to name
+	var endpoint *Endpoint
+	{
+		for _, ep := range ac.Spec.EndpointMap {
+			if strings.EqualFold(ep.Name, endpointName) {
+				endpoint = &ep
+				break
+			}
+		}
+		if endpoint == nil {
+			return nil, g.Error("endpoint not found: %s", endpointName)
+		}
+		// set endpoint conn
+		endpoint.conn = ac
+		endpoint.auth = APIStateAuth{Mutex: &sync.Mutex{}}
+
+		if err = compileSpecEndpoint(endpoint, ac.Spec); err != nil {
+			return nil, g.Error(err, "endpoint validation failed")
+		}
+
+		g.Trace(`Compiled Spec for Endpoint "%s": %s`, endpoint.Name, g.Marshal(endpoint))
+	}
+
+	if endpoint.Disabled {
+		return nil, g.Error(err, "endpoint is disabled in spec")
+	}
+
+	if err := endpoint.EnsureAuthenticated(); err != nil {
+		return nil, g.Error(err, "could not authenticate")
+	}
+
+	// make context map
+	endpoint.setContextMap(sCfg)
+
+	// setup if specified
+	if err = endpoint.setup(); err != nil {
+		return nil, g.Error(err, "could not setup for main request")
+	}
+
+	// register queues being used by endpoint
+	{
+		// Regex pattern to match queue references like "queue.name"
+		queuePattern := regexp.MustCompile(`queue\.([a-zA-Z0-9_]+)`)
+		foundQueues := make(map[string]bool) // Track unique queues
+
+		// Extract queues from processor outputs
+		for _, processor := range endpoint.Response.Processors {
+			matches := queuePattern.FindAllStringSubmatch(processor.Output, -1)
+			for _, match := range matches {
+				if len(match) > 1 {
+					queueName := match[1]
+					foundQueues[queueName] = true
+				}
+			}
+		}
+
+		// Extract queues from iterate over expression
+		if overStr := cast.ToString(endpoint.Iterate.Over); overStr != "" {
+			matches := queuePattern.FindAllStringSubmatch(overStr, -1)
+			for _, match := range matches {
+				if len(match) > 1 {
+					queueName := match[1]
+					foundQueues[queueName] = true
+				}
+			}
+		}
+
+		// Register all found queues (existence is validated at LoadSpec time
+		// by checking that every consumer has at least one producer)
+		for queueName := range foundQueues {
+			_, err = ac.RegisterQueue(queueName)
+			if err != nil {
+				return nil, g.Error(err, "could not register queue: %s", queueName)
+			}
+		}
+	}
+
+	// start request process
+	ds, err := streamRequests(endpoint, sCfg)
+	if err != nil {
+		return nil, g.Error(err, "could not stream requests")
+	}
+
+	// queue_only endpoints: drain the datastream synchronously so the request
+	// loop fires processors and populates queues, then return an empty closed
+	// dataflow so the caller (task_run_read.go) treats it as a no-record stream.
+	if endpoint.QueueOnly {
+		if _, err = ds.Collect(0); err != nil {
+			// on failure, don't mark queues done — consumers stop via context cancel
+			return nil, g.Error(err, "queue_only endpoint failed during drain")
+		}
+
+		// mark produced queues done (only after success) to unblock eager consumers
+		for _, queueName := range endpoint.ProducerQueueNames() {
+			if q, ok := ac.GetQueue(queueName); ok {
+				q.Flush()
+				if err = q.MarkDone(); err != nil {
+					return nil, g.Error(err, "could not mark queue done: %s", queueName)
+				}
+			}
+		}
+
+		if err = endpoint.teardown(); err != nil {
+			return nil, g.Error(err, "could not teardown queue_only endpoint")
+		}
+		df = iop.NewDataflowContext(ac.Context.Ctx)
+		df.Columns = iop.NewColumnsFromFields("_sling_queue_only")
+		df.Streams = append(df.Streams, ds) // for count
+		df.Ready = true
+		df.Close() // sets the closed flag and closes StreamCh
+		return df, nil
+	}
+
+	df, err = iop.MakeDataFlow(ds)
+	if err != nil {
+		return nil, g.Error(err, "could not make dataflow")
+	}
+
+	df.Defer(func() {
+		// teardown if specified
+		if err = endpoint.teardown(); err != nil {
+			df.Context.CaptureErr(g.Error(err, "could not teardown for main request"))
+		}
+	})
+
+	// now that columns are detected, set the metadata for PK
+	if len(df.Buffer) > 0 {
+		primaryKey := endpoint.Response.Records.PrimaryKey
+
+		// When a column selection is applied, the primary-key column(s) may have
+		// been excluded by the user's `select`. Keep only PK columns that survived
+		// into the final columns so SetKeys does not fail on a missing column.
+		if len(sCfg.Select) > 0 && len(primaryKey) > 0 {
+			survivingPK := make([]string, 0, len(primaryKey))
+			for _, pk := range primaryKey {
+				if df.Columns.GetColumn(pk) != nil {
+					survivingPK = append(survivingPK, pk)
+				}
+			}
+			primaryKey = survivingPK
+		}
+
+		err = df.Columns.SetKeys(iop.PrimaryKey, primaryKey...)
+		if err != nil {
+			return nil, g.Error(err, "could not set primary key column")
+		}
+	}
+
+	return
+}
+
+type APIState struct {
+	Env     map[string]string     `json:"env,omitempty"`
+	State   map[string]any        `json:"state,omitempty"`
+	Store   map[string]any        `json:"store,omitempty"`
+	Inputs  map[string]any        `json:"inputs,omitempty"`
+	Secrets map[string]any        `json:"secrets,omitempty"`
+	Queues  map[string]*iop.Queue `json:"queues,omitempty"` // appends to file
+	Auth    APIStateAuth          `json:"auth,omitempty"`
+}
+
+type APIStateAuth struct {
+	Authenticated bool              `json:"authenticated,omitempty"`
+	Token         string            `json:"token,omitempty"`      // refresh token?
+	Headers       map[string]string `json:"-"`                    // to inject
+	ExpiresAt     int64             `json:"expires_at,omitempty"` // Unix timestamp when auth expires
+
+	Sign  func(*Iteration, *http.Request, []byte) error `json:"-"`          // for AWS Sigv4, HMAC
+	Mutex *sync.Mutex                                   `json:"-" yaml:"-"` // Mutex for auth operations
+}
+
+var bracketRegex = regexp.MustCompile(`\{([^\{\}]+)\}`)
+
+func (ac *APIConnection) getStateMap(extraMaps map[string]any) map[string]any {
+
+	sections := []string{"env", "state", "secrets", "auth", "sync"}
+
+	ac.Context.Lock()
+	defer ac.Context.Unlock()
+
+	// Create deep copies of the state maps to avoid concurrent access issues
+	stateMapCopy := make(map[string]any)
+	if ac.State.State != nil {
+		for k, v := range ac.State.State {
+			stateMapCopy[k] = v
+		}
+	}
+
+	envCopy := make(map[string]string)
+	if ac.State.Env != nil {
+		for k, v := range ac.State.Env {
+			envCopy[k] = v
+		}
+	}
+
+	secretsCopy := make(map[string]any)
+	if ac.State.Secrets != nil {
+		for k, v := range ac.State.Secrets {
+			secretsCopy[k] = v
+		}
+	}
+
+	inputsCopy := make(map[string]any)
+	if ac.State.Inputs != nil {
+		for k, v := range ac.State.Inputs {
+			inputsCopy[k] = v
+		}
+	}
+
+	stateMap := g.M(
+		"env", envCopy,
+		"state", stateMapCopy,
+		"secrets", secretsCopy,
+		"inputs", inputsCopy,
+		"auth", ac.State.Auth,
+	)
+
+	// Add queues to the state map
+	if ac.State.Queues != nil {
+		queueMap := g.M()
+		for name, queue := range ac.State.Queues {
+			queueMap[name] = queue // Store the queue name as a reference
+		}
+		stateMap["queue"] = queueMap
+	}
+
+	// Process extraMaps without holding the main lock
+	for mapKey, newVal := range extraMaps {
+		// non-map values
+		if g.In(mapKey, "records") {
+			stateMap[mapKey] = newVal
+			continue
+		}
+
+		// get old/existing map
+		var oldMap map[string]any
+		if oldMapV, ok := stateMap[mapKey]; ok {
+			oldMap, _ = g.UnmarshalMap(g.Marshal(oldMapV))
+		} else {
+			oldMap = g.M()
+		}
+
+		// get new map
+		newMap, _ := g.UnmarshalMap(g.Marshal(newVal))
+		for k, v := range newMap {
+			oldMap[k] = v // overwrite
+		}
+
+		// rewrite after merging
+		stateMap[mapKey] = oldMap
+	}
+
+	// remake map for jmespath to work
+	for _, section := range sections {
+		subMap, _ := g.UnmarshalMap(g.Marshal(stateMap[section]))
+		stateMap[section] = subMap // set back
+	}
+
+	return stateMap
+}
+
+func (ac *APIConnection) renderString(val any, extraMaps ...map[string]any) (newVal string, err error) {
+	em := g.M()
+	if len(extraMaps) > 0 {
+		em = extraMaps[0]
+	}
+
+	return ac.evaluator.RenderString(val, ac.getStateMap(em))
+}
+
+func (ac *APIConnection) renderStringSafe(val any, extraMaps ...map[string]any) (newVal string, err error) {
+	em := g.M()
+	if len(extraMaps) > 0 {
+		em = extraMaps[0]
+	}
+
+	return ac.evaluatorSafe.RenderString(val, ac.getStateMap(em))
+}
+
+func (ac *APIConnection) renderAny(input any, extraMaps ...map[string]any) (output any, err error) {
+	em := g.M()
+	if len(extraMaps) > 0 {
+		em = extraMaps[0]
+	}
+
+	return ac.evaluator.RenderAny(input, ac.getStateMap(em))
+}
+
+func (ac *APIConnection) renderAnySafe(input any, extraMaps ...map[string]any) (output any, err error) {
+	em := g.M()
+	if len(extraMaps) > 0 {
+		em = extraMaps[0]
+	}
+
+	return ac.evaluatorSafe.RenderAny(input, ac.getStateMap(em))
+}
+
+// GetSyncedState cycles through each endpoint, and collects the values
+// for each of the Endpoint.Sync values. Output is a
+// map[Sync.value] = Endpoint.syncMap[Sync.value]
+func (ac *APIConnection) GetSyncedState(endpointName string) (data map[string]any, err error) {
+	data = make(map[string]any)
+
+	// Render dynamic endpoints first to ensure they exist in EndpointMap
+	if err = ac.RenderDynamicEndpoints(); err != nil {
+		return nil, g.Error(err, "could not render dynamic endpoints for sync state")
+	}
+
+	// Iterate through all endpoints
+	for _, endpoint := range ac.Spec.EndpointMap {
+		// Skip if no sync values defined
+		if len(endpoint.Sync) == 0 || !strings.EqualFold(endpoint.Name, endpointName) {
+			continue
+		}
+
+		// Collect each sync value from endpoint's state with proper locking
+		endpoint.context.Lock()
+		for _, syncKey := range endpoint.Sync {
+			if val, ok := endpoint.State[syncKey]; ok {
+				data[syncKey] = val
+			}
+		}
+		endpoint.context.Unlock()
+	}
+
+	return data, nil
+}
+
+// GetSyncUpdateKey returns the sync key and update key for an endpoint
+// if the endpoint has:
+// 1. A sync key defined in Sync array
+// 2. A processor with aggregation="maximum" that outputs to "state.<sync_key>"
+// 3. An update_key defined in Response.Records.UpdateKey
+// Returns empty strings if conditions are not met.
+func (ac *APIConnection) GetSyncUpdateKey(endpointName string) (syncKey, updateKey string, err error) {
+	// Render dynamic endpoints first to ensure they exist in EndpointMap
+	if err = ac.RenderDynamicEndpoints(); err != nil {
+		return "", "", g.Error(err, "could not render dynamic endpoints")
+	}
+
+	// Find the endpoint by name (case-insensitive)
+	var endpoint *Endpoint
+	for _, ep := range ac.Spec.EndpointMap {
+		if strings.EqualFold(ep.Name, endpointName) {
+			epCopy := ep
+			endpoint = &epCopy
+			break
+		}
+	}
+
+	if endpoint == nil {
+		return "", "", g.Error("endpoint not found: %s", endpointName)
+	}
+
+	// Check if endpoint has sync keys
+	if len(endpoint.Sync) == 0 {
+		return "", "", nil
+	}
+
+	// Check if endpoint has update_key
+	updateKey = endpoint.Response.Records.UpdateKey
+	if updateKey == "" {
+		return "", "", nil
+	}
+
+	// Build a set of sync keys for quick lookup
+	syncKeySet := make(map[string]bool)
+	for _, sk := range endpoint.Sync {
+		syncKeySet[sk] = true
+	}
+
+	// Look for a processor with aggregation="maximum" that writes to a sync key
+	for _, processor := range endpoint.Response.Processors {
+		if processor.Aggregation != AggregationTypeMaximum {
+			continue
+		}
+
+		// Check if expression matches "record.<update_key>"
+		if !strings.EqualFold(processor.Expression, "record."+updateKey) {
+			continue
+		}
+
+		// Check if output is "state.<key>" where <key> is in sync keys
+		if !strings.HasPrefix(processor.Output, "state.") {
+			continue
+		}
+
+		stateKey := strings.TrimPrefix(processor.Output, "state.")
+		if syncKeySet[stateKey] {
+			return stateKey, updateKey, nil
+		}
+	}
+
+	// No matching processor found
+	return "", "", nil
+}
+
+// PutSyncedState restores the state from previous run in each endpoint
+// using the Endpoint.Sync values.
+// Inputs is map[Sync.value] = Endpoint.syncMap[Sync.value]
+func (ac *APIConnection) PutSyncedState(endpointName string, data map[string]any) (err error) {
+	// Render dynamic endpoints first to ensure they exist in EndpointMap
+	if err = ac.RenderDynamicEndpoints(); err != nil {
+		return g.Error(err, "could not render dynamic endpoints for sync state")
+	}
+
+	// Iterate through all endpoints
+	for key, endpoint := range ac.Spec.EndpointMap {
+
+		// Skip if no sync values defined or no data for this endpoint
+		if len(endpoint.Sync) == 0 || !strings.EqualFold(endpoint.Name, endpointName) || len(data) == 0 {
+			continue
+		}
+
+		// Initialize state map if nil and sync state with proper locking
+		endpoint.context.Lock()
+		if endpoint.syncMap == nil {
+			endpoint.syncMap = make(StateMap)
+		}
+
+		// Restore each sync value to endpoint's state
+		for key, val := range data {
+			// Only restore if it's in the sync list
+			for _, syncKey := range endpoint.Sync {
+				if syncKey == key {
+					endpoint.syncMap[key] = val
+					break
+				}
+			}
+		}
+		endpoint.context.Unlock()
+
+		ac.Spec.EndpointMap[key] = endpoint
+	}
+
+	return nil
+}
+
+func (iter *Iteration) hasBrackets(expr string) bool {
+	matches, _ := iter.endpoint.conn.evaluator.FindMatches(expr)
+	return len(matches) > 0
+}
+
+var (
+	streamRequests = func(ep *Endpoint, sCfg APIStreamConfig) (ds *iop.Datastream, err error) {
+		return nil, g.Error("please use the official sling-cli release for reading APIs")
+	}
+	compileSpecEndpoint = func(ep *Endpoint, spec Spec) (err error) {
+		return g.Error("please use the official sling-cli release for reading APIs")
+	}
+	runSequence = func(s Sequence, ep *Endpoint) (err error) {
+		return g.Error("please use the official sling-cli release for running API sequences")
+	}
+	FetchSpec = func(_ string) (string, error) {
+		return "", g.Error("please use the official sling-cli release for fetching API specs")
+	}
+)
+
+// RegisterQueue creates a new queue with the given name
+// If a queue with the same name already exists, it is returned
+func (ac *APIConnection) RegisterQueue(name string) (*iop.Queue, error) {
+	ac.Context.Lock()
+	defer ac.Context.Unlock()
+
+	// Return existing queue if it exists
+	if q, exists := ac.State.Queues[name]; exists {
+		return q, nil
+	}
+
+	// Create new queue
+	q, err := iop.NewQueue(name)
+	if err != nil {
+		return nil, err
+	}
+
+	// Register the queue
+	ac.State.Queues[name] = q
+	return q, nil
+}
+
+// GetQueue retrieves a queue by name
+func (ac *APIConnection) GetQueue(name string) (*iop.Queue, bool) {
+	ac.Context.Lock()
+	defer ac.Context.Unlock()
+
+	q, exists := ac.State.Queues[name]
+	return q, exists
+}
+
+// RemoveQueue closes and removes a queue
+func (ac *APIConnection) RemoveQueue(name string) error {
+	ac.Context.Lock()
+	defer ac.Context.Unlock()
+
+	q, exists := ac.State.Queues[name]
+	if !exists {
+		return nil
+	}
+
+	err := q.Close()
+	delete(ac.State.Queues, name)
+	return err
+}
+
+// CloseAllQueues closes all queues associated with this connection
+func (ac *APIConnection) CloseAllQueues() {
+	ac.Context.Lock()
+	defer ac.Context.Unlock()
+
+	for name, queue := range ac.State.Queues {
+		if err := queue.Close(); err != nil {
+			g.Warn("failed to close queue %s: %v", name, err)
+		}
+		delete(ac.State.Queues, name)
+	}
+}
+
+// renderEndpointTemplate renders an endpoint template with the given state variables
+func (ac *APIConnection) renderEndpointTemplate(dynEndpoint DynamicEndpoint, iterValue any, extraState map[string]any) (*Endpoint, error) {
+	// Deep copy the endpoint template
+	endpointJSON := g.Marshal(dynEndpoint.Endpoint)
+	if endpointJSON == "" {
+		return nil, g.Error("could not marshal endpoint template")
+	}
+
+	var renderedEndpoint Endpoint
+	if err := g.Unmarshal(endpointJSON, &renderedEndpoint); err != nil {
+		return nil, g.Error(err, "could not unmarshal endpoint template")
+	}
+
+	// Set originalMap so validateAndSetDefaults knows which fields were explicitly set
+	// This prevents defaults from overwriting our rendered values
+	var originalMap map[string]any
+	if err := g.Unmarshal(endpointJSON, &originalMap); err != nil {
+		return nil, g.Error(err, "could not unmarshal endpoint template to map")
+	}
+	renderedEndpoint.originalMap = originalMap
+
+	// Build state map for rendering with the iteration value
+	stateMap := g.M()
+
+	// Copy any extra state values
+	for k, v := range extraState {
+		stateMap[k] = v
+	}
+
+	// Set the iteration value in state (into variable)
+	if dynEndpoint.Into != "" {
+		// Parse the into path (e.g., "state.table_name")
+		parts := strings.Split(dynEndpoint.Into, ".")
+		if len(parts) == 2 && parts[0] == "state" {
+			stateMap[parts[1]] = iterValue
+		} else {
+			return nil, g.Error("invalid 'into' variable: %s (must be in format 'state.variable_name')", dynEndpoint.Into)
+		}
+	}
+
+	// Create extra maps for rendering - this will be merged with ac.State.State
+	extraMaps := g.M("state", stateMap)
+
+	g.Trace("rendering dynamic endpoint %s with extra state map: %s", dynEndpoint.Endpoint.Name, g.Marshal(extraMaps))
+
+	// we only want to render the "into" state, leave the rest so that they are render at compilation
+	evaluator := iop.NewEvaluator([]string{"state"})
+	evaluator.KeepMissingExpr = true // this tells evaluator to leave expression if missing
+
+	// Render the endpoint name
+	if renderedEndpoint.Name != "" {
+		renderedName, err := evaluator.RenderString(renderedEndpoint.Name, extraMaps)
+		if err != nil {
+			return nil, g.Error(err, "could not render endpoint name")
+		}
+		renderedEndpoint.Name = renderedName
+	}
+
+	// Render description if present
+	if renderedEndpoint.Description != "" {
+		renderedDesc, err := evaluator.RenderString(renderedEndpoint.Description, extraMaps)
+		if err != nil {
+			return nil, g.Error(err, "could not render endpoint description")
+		}
+		renderedEndpoint.Description = renderedDesc
+	}
+
+	// Render docs URL if present
+	if renderedEndpoint.Docs != "" {
+		renderedDocs, err := evaluator.RenderString(renderedEndpoint.Docs, extraMaps)
+		if err != nil {
+			return nil, g.Error(err, "could not render endpoint docs")
+		}
+		renderedEndpoint.Docs = renderedDocs
+	}
+
+	// Initialize state and context for the endpoint
+	renderedEndpoint.context = g.NewContext(ac.Context.Ctx)
+	renderedEndpoint.Dynamic = true
+	if renderedEndpoint.State == nil {
+		renderedEndpoint.State = stateMap
+	} else {
+		for k, v := range stateMap {
+			// only set if key doesn't exist
+			if _, exists := renderedEndpoint.State[k]; !exists {
+				renderedEndpoint.State[k] = v
+			}
+		}
+	}
+
+	return &renderedEndpoint, nil
+}
+
+// RenderDynamicEndpoints will render the dynamic objects
+// basically mutating the spec endpoints.
+// Needs to authenticate first
+func (ac *APIConnection) RenderDynamicEndpoints() (err error) {
+	if !ac.Spec.IsDynamic() {
+		return nil // No dynamic endpoints to render
+	} else if ac.Spec.rendered {
+		return nil
+	}
+
+	// Ensure authentication before rendering dynamic endpoints
+	if err := ac.EnsureAuthenticated(); err != nil {
+		return g.Error(err, "authentication required for dynamic endpoints")
+	}
+
+	// Initialize EndpointMap if nil
+	if ac.Spec.EndpointMap == nil {
+		ac.Spec.EndpointMap = make(EndpointMap)
+	}
+
+	g.Debug("rendering %d dynamic endpoint definition(s)", len(ac.Spec.DynamicEndpoints))
+
+	// Process each dynamic endpoint definition
+	generatedNames := []string{}
+	for dynIdx, dynEndpoint := range ac.Spec.DynamicEndpoints {
+		g.Debug("processing dynamic endpoint definition %d", dynIdx+1)
+
+		// Create ephemeral state for setup sequence
+		setupState := g.M()
+
+		// Copy current state
+		ac.Context.Lock()
+		for k, v := range ac.State.State {
+			setupState[k] = v
+		}
+		ac.Context.Unlock()
+
+		// Execute setup sequence if defined
+		if len(dynEndpoint.Setup) > 0 {
+			g.Debug("running setup sequence (%d calls)", len(dynEndpoint.Setup))
+
+			baseEndpoint := &Endpoint{
+				Name:      "dynamic.setup",
+				context:   g.NewContext(ac.Context.Ctx),
+				conn:      ac,
+				State:     setupState,
+				aggregate: NewAggregateState(),
+				auth:      APIStateAuth{Mutex: &sync.Mutex{}},
+			}
+
+			if err := runSequence(dynEndpoint.Setup, baseEndpoint); err != nil {
+				return g.Error(err, "dynamic endpoint setup failed for definition %d", dynIdx+1)
+			}
+
+			// Sync state back
+			setupState = baseEndpoint.State
+		}
+
+		// Evaluate the iterate expression to get the list of items.
+		// `Iterate` can be:
+		//   1. a native YAML/JSON array (or single object) → use directly
+		//   2. a string starting with [ or { → JSON literal, parsed as-is (no template render)
+		//   3. any other string → rendered against state, then evaluated as a JMESPath expression
+		var iterList []any
+
+		switch iterVal := dynEndpoint.Iterate.(type) {
+		case nil:
+			return g.Error("dynamic endpoint definition %d: 'iterate' is required", dynIdx+1)
+		case []any:
+			// Native inline list (e.g. raw YAML array of strings or objects).
+			// Round-trip through JSON so nested YAML maps (`map[interface{}]interface{}`)
+			// are normalised to `map[string]any` for template/JMESPath consumption.
+			if err := g.JSONConvert(iterVal, &iterList); err != nil {
+				return g.Error(err, "could not normalise inline iterate list")
+			}
+		case map[string]any, map[any]any:
+			// Native inline single object — treat as a one-element list.
+			var normalised map[string]any
+			if err := g.JSONConvert(iterVal, &normalised); err != nil {
+				return g.Error(err, "could not normalise inline iterate object")
+			}
+			iterList = []any{normalised}
+		case string:
+			trimmed := strings.TrimSpace(iterVal)
+			var iterExpr string
+			if strings.HasPrefix(trimmed, "[") || strings.HasPrefix(trimmed, "{") {
+				// Don't render JSON literals - they might contain { } that aren't templates
+				iterExpr = iterVal
+			} else {
+				// Render the iterate expression (for state variables like "state.table_list")
+				var err error
+				iterExpr, err = ac.renderString(iterVal, g.M("state", setupState))
+				if err != nil {
+					return g.Error(err, "could not render iterate expression: %s", iterVal)
+				}
+			}
+
+			// Try to parse as JSON literal first (for arrays like '["a", "b", "c"]' or objects)
+			trimmed = strings.TrimSpace(iterExpr)
+			if strings.HasPrefix(trimmed, "[") || strings.HasPrefix(trimmed, "{") {
+				if err := g.Unmarshal(iterExpr, &iterList); err != nil {
+					return g.Error(err, "could not parse iterate expression as JSON: %s", iterExpr)
+				}
+				g.Debug("parsed iterate expression as JSON literal")
+			} else {
+				// Evaluate as JMESPath expression
+				stateMap := ac.getStateMap(g.M("state", setupState))
+				result, err := jmespath.Search(iterExpr, stateMap)
+				if err != nil {
+					return g.Error(err, "could not evaluate iterate expression: %s", iterExpr)
+				}
+
+				// Convert result to array
+				switch v := result.(type) {
+				case []any:
+					iterList = v
+				default:
+					// Try to convert to array
+					if err := g.JSONConvert(result, &iterList); err != nil {
+						return g.Error(err, "iterate expression did not return an array: %s (got type %T)", iterExpr, result)
+					}
+				}
+			}
+		default:
+			// Fallback: round-trip through JSON to normalise (e.g. []map[string]any or []string).
+			if err := g.JSONConvert(iterVal, &iterList); err != nil {
+				return g.Error(err, "dynamic endpoint definition %d: 'iterate' has unsupported type %T", dynIdx+1, iterVal)
+			}
+		}
+
+		if len(iterList) == 0 {
+			g.Warn("dynamic endpoint definition %d: iterate expression returned empty list", dynIdx+1)
+			continue
+		}
+
+		g.Debug("iterating over %d items to generate endpoints", len(iterList))
+
+		// Generate endpoints for each item in the iteration list
+		for itemIdx, iterValue := range iterList {
+			// Render the endpoint template with the current iteration value
+			renderedEndpoint, err := ac.renderEndpointTemplate(dynEndpoint, iterValue, setupState)
+			if err != nil {
+				return g.Error(err, "failed to render endpoint template for item %d", itemIdx+1)
+			}
+
+			// Check for duplicate endpoint names
+			if _, exists := ac.Spec.EndpointMap[renderedEndpoint.Name]; exists {
+				return g.Error("duplicate endpoint name generated: %s (check your dynamic endpoint template)", renderedEndpoint.Name)
+			}
+
+			g.Trace("rendered dynamic endpoint: %s => %s", renderedEndpoint.Name, g.Marshal(renderedEndpoint))
+
+			// Add to endpoint map
+			ac.Spec.EndpointMap[renderedEndpoint.Name] = *renderedEndpoint
+			ac.Spec.endpointsOrdered = append(ac.Spec.endpointsOrdered, renderedEndpoint.Name)
+
+			generatedNames = append(generatedNames, renderedEndpoint.Name)
+		}
+	}
+
+	ac.Spec.rendered = true
+	g.Debug("dynamic endpoint rendering complete, generated %d total endpoints: %s", len(generatedNames), g.Marshal(generatedNames))
+	return nil
+}

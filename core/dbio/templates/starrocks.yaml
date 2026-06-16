@@ -1,0 +1,572 @@
+core:
+  drop_table: drop table if exists {table}
+  drop_view: drop view if exists {view}
+  create_index: "select 'create_index not implemented'"
+  create_table: create table if not exists {table} ({col_types}) {distribution} distributed by hash({hash_key})
+  insert: insert into {table} ({fields}) values ({values})
+  alter_columns: alter table {table} modify {col_ddl}
+  modify_column: '{column} {type}'
+  update: insert into {table} ({fields}) select {updated_fields} from {table}
+  upsert: |
+    insert into {tgt_table}
+      ({insert_fields})
+    select {src_fields}
+    from {src_table} src
+  rename_column: |
+    alter table {table} add column {new_column} {new_type} ;
+    insert into {table} ({fields}) select {updated_fields} from {table} ;
+    alter table {table} drop column {column} ;
+
+  show_alter_table: show alter table column from `{schema}` where tablename = "{table}" order by createtime desc limit 1
+
+  # StarRocks merge strategies:
+  # - All strategies work on Primary Key tables (created with table_keys.primary)
+  # - Only 'insert' works on Duplicate Key tables (default)
+  # See: https://docs.starrocks.io/docs/sql-reference/sql-statements/table_bucket_part_index/DELETE/
+  # StarRocks Primary Key tables perform a native upsert on plain INSERT (rows
+  # with an existing primary key are replaced), which is the desired incremental
+  # behavior. Adding a NOT EXISTS / NOT IN skip-existing guard would defeat that
+  # by skipping updates, so merge_insert is left as a plain INSERT.
+  merge_insert: |
+    INSERT INTO {tgt_table} ({insert_fields})
+    SELECT {src_fields} FROM {src_table} src
+
+  # StarRocks UPDATE with FROM clause doesn't support target table alias,
+  # and set_fields uses src.column format which requires the FROM clause.
+  # This is complex to implement correctly, so merge_update is disabled.
+  # Use merge_update_insert or merge_delete_insert instead.
+  merge_update: null
+
+  # StarRocks doesn't have native MERGE, so we use DELETE+INSERT
+  merge_update_insert: |
+    DELETE FROM {tgt_table}
+    WHERE ({tgt_pk_fields}) IN (
+      SELECT {src_pk_fields} FROM {src_table}
+    );
+    INSERT INTO {tgt_table} ({insert_fields})
+    SELECT {src_fields} FROM {src_table} src
+
+  merge_delete_insert: |
+    DELETE FROM {tgt_table}
+    WHERE ({tgt_pk_fields}) IN (
+      SELECT {src_pk_fields} FROM {src_table}
+    );
+    INSERT INTO {tgt_table} ({insert_fields})
+    SELECT {src_fields} FROM {src_table} src
+
+  merge_change_capture: |
+    DELETE FROM {tgt_table}
+    WHERE ({tgt_pk_fields}) IN (
+      SELECT {pk_fields} FROM (
+        SELECT {pk_fields}, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
+        FROM {src_table}
+      ) sub
+      WHERE _rn = 1
+    );
+    INSERT INTO {tgt_table} ({insert_fields})
+    SELECT {src_fields} FROM (
+      SELECT *, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
+      FROM {src_table}
+      WHERE _sling_synced_op != 'D'
+    ) sub WHERE _rn = 1
+    AND ({pk_fields}) NOT IN (
+      SELECT {pk_fields} FROM (
+        SELECT {pk_fields}, _sling_synced_op, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
+        FROM {src_table}
+      ) del WHERE _rn = 1 AND _sling_synced_op = 'D'
+    )
+
+  merge_change_capture_soft: |
+    UPDATE {tgt_table} SET _sling_synced_at = now(), _sling_synced_op = 'D'
+    WHERE _sling_synced_op != 'D'
+    AND ({tgt_pk_fields}) IN (
+      SELECT {pk_fields} FROM (
+        SELECT {pk_fields}, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
+        FROM {src_table}
+      ) sub
+      WHERE _rn = 1
+    );
+    DELETE FROM {tgt_table}
+    WHERE ({tgt_pk_fields}) IN (
+      SELECT {pk_fields} FROM (
+        SELECT {pk_fields}, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
+        FROM {src_table}
+        WHERE _sling_synced_op != 'D'
+      ) sub
+      WHERE _rn = 1
+    );
+    INSERT INTO {tgt_table} ({insert_fields})
+    SELECT {src_fields} FROM (
+      SELECT *, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
+      FROM {src_table}
+      WHERE _sling_synced_op != 'D'
+    ) sub WHERE _rn = 1
+    AND ({pk_fields}) NOT IN (
+      SELECT {pk_fields} FROM (
+        SELECT {pk_fields}, _sling_synced_op, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
+        FROM {src_table}
+      ) del WHERE _rn = 1 AND _sling_synced_op = 'D'
+    )
+
+metadata:
+  current_database: select database() as name from dual
+  
+  databases: show databases
+    
+  schemas: |
+    select schema_name
+    from information_schema.schemata
+    order by schema_name
+    
+  tables: |
+    select table_schema as schema_name, table_name, 'false' as is_view
+    from information_schema.tables
+    where table_type = 'BASE TABLE'
+      {{if .schema -}} and table_schema = '{schema}' {{- end}}
+    order by table_schema, table_name
+    
+  views: |
+    select table_schema as schema_name, table_name, 'true' as is_view
+    from information_schema.tables
+    where table_type = 'VIEW'
+      {{if .schema -}} and table_schema = '{schema}' {{- end}}
+    order by table_schema, table_name
+
+  columns: |
+    select column_name,
+      case
+        when data_type = 'tinyint' and column_type like '%unsigned%' then 'unsigned tinyint'
+        when data_type = 'tinyint' then column_type
+        else data_type
+      end as data_type
+    from information_schema.columns
+    where table_schema = '{schema}'
+      and table_name = '{table}'
+    order by ordinal_position
+
+  primary_keys: |
+    select tco.constraint_name as pk_name,
+           kcu.ordinal_position as position,
+           kcu.column_name as column_name
+    from information_schema.table_constraints tco
+    join information_schema.key_column_usage kcu  
+      on kcu.constraint_catalog = tco.constraint_catalog
+      and kcu.constraint_schema = tco.constraint_schema
+      and kcu.table_schema = tco.table_schema
+      and kcu.table_name = tco.table_name
+    where kcu.table_schema = '{schema}'
+      and kcu.table_name = '{table}'
+    order by kcu.table_schema,
+             kcu.table_name,
+             position
+
+  indexes: |
+    select
+      index_name as index_name,
+      column_name as column_name
+    from information_schema.statistics
+    where table_schema = '{schema}'
+      and table_name = '{table}'
+    order by
+      index_name,
+      seq_in_index    
+  
+  columns_full: |
+    with tables as (
+      select
+        table_catalog,
+        table_schema,
+        table_name,
+        case table_type
+          when 'VIEW' then true
+          else false
+        end as is_view
+      from information_schema.tables
+      where table_schema = '{schema}' and table_name = '{table}'
+    )
+    select
+      cols.table_schema as schema_name,
+      cols.table_name as table_name,
+      cols.column_name as column_name,
+      cols.data_type as data_type,
+      cols.ordinal_position as position
+    from information_schema.columns cols
+    join tables
+      on tables.table_schema = cols.table_schema
+      and tables.table_name = cols.table_name
+    order by cols.table_catalog, cols.table_schema, cols.table_name, cols.ordinal_position
+
+  schemata: |
+    with tables as (
+      select
+        table_catalog,
+        table_schema,
+        table_name,
+        case table_type
+          when 'VIEW' then true
+          else false
+        end as is_view
+      from information_schema.tables
+      where 1=1
+        {{if .schema -}} and table_schema = '{schema}' {{- end}}
+        {{if .tables -}} and table_name in ({tables}) {{- end}}
+    )
+    select
+      cols.table_schema as schema_name,
+      cols.table_name as table_name,
+      tables.is_view as is_view,
+      cols.column_name as column_name,
+      case
+        when cols.data_type = 'tinyint' and cols.column_type like '%unsigned%' then 'unsigned tinyint'
+        when cols.data_type = 'tinyint' then cols.column_type
+        else cols.data_type
+      end as data_type,
+      cols.ordinal_position as position
+    from information_schema.columns cols
+    join tables
+      on tables.table_schema = cols.table_schema
+      and tables.table_name = cols.table_name
+    order by cols.table_catalog, cols.table_schema, cols.table_name, cols.ordinal_position
+  
+  ddl_table: SHOW CREATE TABLE `{schema}`.`{table}`
+  ddl_view: SHOW CREATE TABLE `{schema}`.`{table}`
+
+analysis:
+  # table level
+  table_count: |
+    -- table_count {table}
+    select
+      '{schema}' as schema_nm,
+      '{table}' as table_nm,
+      count(*) cnt
+    from `{schema}`.`{table}`
+
+  field_chars: |
+    -- field_chars {table}
+    select
+      '{schema}' as schema_nm,
+      '{table}' as table_nm,
+      '{field}' as field,
+      sum(case when regexp_like({field}, '\\n') then 1 else 0 end) as cnt_nline,
+      sum(case when regexp_like({field}, '\\t') then 1 else 0 end) as cnt_tab,
+      sum(case when regexp_like({field}, ',') then 1 else 0 end) as cnt_comma,
+      sum(case when regexp_like({field}, '"') then 1 else 0 end) as cnt_dquote
+    from `{schema}`.`{table}`
+
+  field_pk_test: |
+    -- field_pk_test {table}
+    select
+      '`{schema}`.`{table}`' as table_nm,
+      case when count(*) = count(distinct {field}) then 'PASS' else 'FAIL' end as result,
+      count(*) as tot_cnt,
+      count(distinct {field}) as dstct_cnt
+    from `{schema}`.`{table}`
+
+  field_stat: |
+    -- field_stat {field}
+    select
+      '{schema}' as schema_nm,
+      '{table}' as table_nm,
+      '{field}' as field,
+      count(*) as tot_cnt,
+      count({field}) as f_cnt,
+      count(*) - count({field}) as f_null_cnt,
+      round(100.0 * (count(*) - count({field})) / count(*), 1) as f_null_prct,
+      count(distinct {field}) as f_dstct_cnt,
+      round(100.0 * count(distinct {field}) / count(*), 1) as f_dstct_prct,
+      count(*) - count(distinct {field}) as f_dup_cnt
+    from `{schema}`.`{table}`
+
+  field_stat_group: |
+    -- field_stat_group {field}
+    select
+      '{schema}' as schema_nm,
+      '{table}' as table_nm,
+      {group_expr} as group_exp,
+      '{field}' as field,
+      count(*) as tot_cnt,
+      count({field}) as f_cnt,
+      count(*) - count({field}) as f_null_cnt,
+      round(100.0 * (count(*) - count({field})) / count(*), 1) as f_null_prct,
+      count(distinct {field}) as f_dstct_cnt,
+      round(100.0 * count(distinct {field}) / count(*), 1) as f_dstct_prct,
+      count(*) - count(distinct {field}) as f_dup_cnt
+    from `{schema}`.`{table}`
+    group by {group_expr}
+
+  field_stat_deep: |
+    -- field_stat_deep {field}
+    select
+      '{schema}' as schema_nm,
+      '{table}' as table_nm,
+      '{field}' as field,
+      '{type}' as type,
+      count(*) as tot_cnt,
+      count({field}) as f_cnt,
+      count(*) - count({field}) as f_null_cnt,
+      round(100.0 * (count(*) - count({field})) / count(*), 1) as f_null_prct,
+      count(distinct {field}) as f_dstct_cnt,
+      round(100.0 * count(distinct {field}) / count(*), 1) as f_dstct_prct,
+      count(*) - count(distinct {field}) as f_dup_cnt,
+      cast(min({field}) as char(4000)) as f_min,
+      cast(max({field}) as char(4000)) as f_max,
+      min(length({field})) as f_min_len,
+      max(length({field})) as f_max_len
+    from `{schema}`.`{table}`
+
+  fill_cnt_group_field: |
+    -- fill_cnt_group_field {field}
+    select
+      {field},
+      {columns_sql}
+    from `{schema}`.`{table}`
+    group by {field}
+    order by {field}
+
+  fill_rate_group_field: |
+    -- fill_rate_group_field {field}
+    select
+      {field},
+      {fill_rate_fields_sql}
+    from `{schema}`.`{table}`
+    group by {field}
+    order by {field}
+
+  distro_field: |
+    -- distro_field {field}
+    with t1 as (
+      select
+        '{field}' as field,
+        {field},
+        count(*) cnt
+      from `{schema}`.`{table}`
+      group by {field}
+      order by count(*) desc
+    )
+    , t2 as (
+      select
+        '{field}' as field,
+        count(*) ttl_cnt
+      from `{schema}`.`{table}`
+    )
+    select
+      '{table}' as table_nm,
+      t1.field,
+      {field} as value,
+      cnt,
+      round(100.0 * cnt / ttl_cnt, 2) as prct
+    from t1
+    join t2
+      on t1.field = t2.field
+    order by cnt desc
+
+  distro_field_group: |
+    -- distro_field_group {field}
+    with t1 as (
+      select
+        '{field}' as field,
+        {group_expr} as group_exp,
+        {field},        
+        count(*) cnt
+      from `{schema}`.`{table}`
+      group by {field}, {group_expr}
+      order by count(*) desc
+    )
+    , t2 as (
+      select
+        '{field}' as field,
+        count(*) ttl_cnt
+      from `{schema}`.`{table}`
+    )
+    select
+      '{table}' as table_nm,
+      t1.field,
+      t1.group_exp,
+      {field} as value,
+      cnt,
+      round(100.0 * cnt / ttl_cnt, 2) as prct
+    from t1
+    join t2
+      on t1.field = t2.field
+    order by cnt desc
+
+  distro_field_date: |
+    -- distro_field_date {field}
+    with t1 as (
+        select
+          '{field}' as field,
+          year({field}) as year,
+          month({field}) as month,
+          count(*) cnt
+        from `{schema}`.`{table}`
+        group by year({field}), month({field})
+        order by year({field}), month({field})
+      )
+      , t2 as (
+        select '{field}' as field, count(*) ttl_cnt
+        from `{schema}`.`{table}`
+      )
+      select 
+        '{schema}' as schema_nm,
+        '{table}' as table_nm,
+        t1.field,
+        t1.year,
+        t1.month,
+        cnt,
+        round(100.0 * cnt / ttl_cnt, 2) as prct
+      from t1
+      join t2
+        on t1.field = t2.field
+      order by t1.year, t1.month
+
+  distro_field_date_wide: |
+    -- distro_field_date {table}
+    select
+      '{date_field}' as date_field,
+      year({date_field}) as year,
+      month({date_field}) as month,
+      {columns_sql}
+    from `{schema}`.`{table}`
+    {where_clause}
+    group by year({date_field}), month({date_field})
+    order by year({date_field}), month({date_field})
+
+  test_pk: |
+    select
+      '`{schema}`.`{table}`' as table_nm,
+      '{fields_exp}' as expression,
+      case when count(*) = count(distinct {fields_exp}) then 'PASS' else 'FAIL' end as pk_result,
+      count(*) as tot_cnt,
+      count(distinct {fields_exp}) as expression_cnt,
+      count(*) - count(distinct {fields_exp}) as delta_cnt,
+      sum(case when {fields_exp} is null then 1 else 0 end) as null_cnt
+    from `{schema}`.`{table}`
+    {where_clause}
+
+routine:
+  number_min_max: |
+    select
+      count(*) as tot_cnt,
+      count({field}) as field_cnt,
+      min({field}) as min_val,
+      max({field}) as max_val
+    from `{schema}`.`{table}`
+
+  number_trunc_min_max: |
+    select
+      {fields}
+    from `{schema}`.`{table}`
+    where {where}
+      (({partition_col_trunc} >= '{min_val}'
+      and {partition_col_trunc} <= '{max_val}')
+      {or_null})
+
+  date_trunc_uniques: |
+    select
+      {partition_col_trunc} as day_field,
+      count(*) cnt
+    from `{schema}`.`{table}`
+    {where}
+    group by {partition_col_trunc}
+    order by {partition_col_trunc}
+
+  number_trunc_uniques: |
+    select
+      {partition_col_trunc} as trunc_field,
+      count(*) cnt
+    from `{schema}`.`{table}`
+    {where}
+    group by {partition_col_trunc}
+    order by {partition_col_trunc}
+
+function:
+  replace: replace({string_expr}, {to_replace}, {replacement})
+  str_utf8: '{ field }'
+  cast_to_text: 'cast({field} as varchar(65533))'
+  fill_cnt_field: count({field}) as cnt_{field}
+  fill_rate_field: round(100.0 * count({field}) / count(*), 2) as prct_{field}
+  sleep: select sleep({seconds})
+  checksum_decimal: 'abs(truncate({field}, 0))'
+  checksum_datetime: cast((UNIX_TIMESTAMP({field}) * 1000000) as UNSIGNED)
+  checksum_boolean: '{field}'
+
+variable:
+  bind_string: "?"
+  quote_char: '`'
+  ddl_col: 1
+  batch_rows: 500
+  bool_as: integer
+  error_ignore_drop_view: unknown
+  error_ignore_drop_table: unknown
+  max_string_type: varchar(65533)
+  max_string_length: 65533
+  max_column_length: 1024
+  # Default to 'insert' since most tables are Duplicate Key tables
+  # Use table_keys.primary for Primary Key tables to enable other merge strategies
+  default_merge_strategy: insert
+
+error_filter:
+  table_not_exist: exist
+
+native_type_map:
+  bigint: bigint
+  binary: binary
+  bit: smallint
+  blob: text
+  boolean: bool
+  char: string
+  date: date
+  datetime: datetime
+  decimal: decimal
+  double: float
+  enum: string
+  float: float
+  geomcollection: string
+  geometry: string
+  geometrycollection: string
+  int: integer
+  json: json
+  linestring: string
+  longblob: text
+  longtext: text
+  mediumblob: text
+  mediumint: integer
+  mediumtext: text
+  multilinestring: string
+  multipoint: string
+  multipolygon: string
+  point: string
+  polygon: string
+  set: string
+  smallint: smallint
+  string: text
+  text: text
+  time: time
+  timestamp: timestamp
+  tinyblob: text
+  "tinyint(1)": bool
+  tinyint: smallint
+  tinytext: text
+  "unsigned tinyint": integer
+  varbinary: binary
+  varchar: text
+  year: string
+
+general_type_map:
+  bigint: bigint
+  binary: varbinary
+  bool: boolean
+  date: date
+  datetime: datetime
+  decimal: "decimal(,)"
+  float: double
+  integer: bigint
+  json: json
+  smallint: smallint
+  string: "varchar()"
+  text: "varchar(65533)"
+  time: "varchar()"
+  timestamp: datetime
+  timestampz: datetime
+  timez: "varchar()"
+  uuid: "varchar(36)"

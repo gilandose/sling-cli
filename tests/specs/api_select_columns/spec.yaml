@@ -1,0 +1,85 @@
+name: "API Select Columns Test"
+description: "A public, no-auth API endpoint that returns a single record with many
+  top-level fields (~80+). Used to verify that a replication's stream-level `select`
+  option correctly limits which columns reach the target for API sources.
+  Regression coverage for the bug where `select` was silently ignored for APIs."
+
+defaults:
+  state:
+    base_url: "https://api.github.com"
+  request:
+    headers:
+      Accept: "application/vnd.github+json"
+      User-Agent: "sling-select-columns-test"
+
+endpoints:
+  # GitHub's repo endpoint returns a single object with ~80+ top-level fields.
+  # No authentication needed (unauthenticated rate limit is enough for a test).
+  repo:
+    request:
+      url: "{state.base_url}/repos/slingdata-io/sling-cli"
+      method: GET
+    response:
+      records:
+        jmespath: "@"
+        primary_key: ["id"]
+  repo_override:
+    request:
+      url: "{state.base_url}/repos/slingdata-io/sling-cli"
+      method: GET
+    response:
+      records:
+        jmespath: "@"
+        primary_key: ["id"]
+
+    overrides:
+      select:
+        - id
+        - name
+        - full_name
+  search:
+    request:
+      url: "{state.base_url}/search/repositories"
+      method: GET
+      parameters:
+        q: "sling language:go"
+        per_page: 5
+    response:
+      records:
+        jmespath: "items"
+        primary_key: ["id"]
+
+  # PROBE A: a processor that renames a key AFTER select/order runs.
+  # `full_name` is renamed to `slug` by an object_rename processor. The
+  # `select` lists [id, slug, name, stargazers_count]. If ordering is
+  # computed before processors, `slug` won't exist yet at order time.
+  search_proc_rename:
+    request:
+      url: "{state.base_url}/search/repositories"
+      method: GET
+      parameters:
+        q: "sling language:go"
+        per_page: 5
+    response:
+      records:
+        jmespath: "items"
+        primary_key: ["id"]
+      processors:
+        - expression: 'object_rename(record, "full_name", "slug")'
+          output: record
+
+  # PROBE B: a jq records expression that RESHAPES each record into a new
+  # object with reordered/renamed keys. The select lists the post-jq names.
+  # The raw response bytes no longer match these keys, so order recovery
+  # from respBytes cannot find them.
+  search_jq_reshape:
+    request:
+      url: "{state.base_url}/search/repositories"
+      method: GET
+      parameters:
+        q: "sling language:go"
+        per_page: 5
+    response:
+      records:
+        jq: '.items[] | {id: .id, label: .full_name, title: .name, stars: .stargazers_count}'
+        primary_key: ["id"]

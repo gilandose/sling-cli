@@ -1,0 +1,26 @@
+source: OCRAL_R2
+target: POSTGRES
+
+defaults:
+  object: 'public.{stream_file_name}_slack_data'
+  source_options:
+    flatten: true
+  mode: full-refresh
+
+streams:
+  s3://ocral/mlo.community.test/channels.json:
+  s3://ocral/mlo.community.test/integration_logs.json:
+  s3://ocral/mlo.community.test/users.json:
+  s3://ocral/mlo.community.test/be-shameless/:
+  s3://ocral/mlo.community.test/content-archive/:
+  s3://ocral/mlo.community.test/discussions/:
+  s3://ocral/mlo.community.test/events/:
+  s3://ocral/mlo.community.test/fiddler/:
+  s3://ocral/mlo.community.test/general/:
+  s3://ocral/mlo.community.test/jobs/:
+  s3://ocral/mlo.community.test/leadership/:
+  s3://ocral/mlo.community.test/random/:
+
+env:
+  SLING_THREADS: 5
+  SLING_RETRIES: 2

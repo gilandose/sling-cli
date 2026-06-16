@@ -1,0 +1,15 @@
+source: GOOGLE_STORAGE
+target: BIGQUERY
+
+defaults:
+  object: 'public.{stream_file_name}_slack_data'
+  source_options:
+    flatten: true
+  target_options:
+    adjust_column_type: true
+  mode: full-refresh
+
+streams:
+  gs://flarco_us_bucket/mlo.community.test/be-shameless/:
+  gs://flarco_us_bucket/mlo.community.test/channels.json:
+  gs://flarco_us_bucket/mlo.community.test/integration_logs.json:

@@ -1,0 +1,383 @@
+package connection
+
+import (
+	"context"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/flarco/g"
+	"github.com/gobwas/glob"
+	"github.com/samber/lo"
+	"github.com/slingdata-io/sling-cli/core/dbio"
+	"github.com/slingdata-io/sling-cli/core/dbio/api"
+	"github.com/slingdata-io/sling-cli/core/dbio/database"
+	"github.com/slingdata-io/sling-cli/core/dbio/filesys"
+	"github.com/slingdata-io/sling-cli/core/dbio/iop"
+	"github.com/slingdata-io/sling-cli/core/env"
+	"github.com/spf13/cast"
+)
+
+func (c *Connection) Test() (ok bool, err error) {
+	os.Setenv("SLING_TEST_MODE", "true")
+
+	switch {
+	case c.Type.IsDb():
+		dbConn, err := c.AsDatabase(AsConnOptions{UseCache: c.GetType() == dbio.TypeDbDuckDb})
+		if err != nil {
+			return ok, g.Error(err, "could not initiate %s", c.Name)
+		}
+		err = dbConn.Connect(10)
+		if err != nil {
+			return ok, g.Error(err, "could not connect to %s", c.Name)
+		}
+	case c.Type.IsFile():
+		fileClient, err := c.AsFile(AsConnOptions{UseCache: false})
+		if err != nil {
+			return ok, g.Error(err, "could not initiate %s", c.Name)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		defer cancel()
+		err = fileClient.Init(ctx)
+		if err != nil {
+			return ok, g.Error(err, "could not connect to %s", c.Name)
+		}
+
+		url := c.URL()
+
+		g.Trace("file test inputs: %s", g.Marshal(g.M("url", url)))
+		nodes, err := fileClient.List(url)
+		if err != nil {
+			return ok, g.Error(err, "could not connect to %s", c.Name)
+		}
+		g.Debug("unfiltered nodes returned: %d", len(nodes))
+		if len(nodes) <= 10 {
+			g.Debug(g.Marshal(nodes.Paths()))
+		}
+	case c.Type.IsAPI():
+		apiClient, err := c.AsAPI(AsConnOptions{UseCache: false})
+		if err != nil {
+			return ok, g.Error(err, "could not initiate %s", c.Name)
+		}
+
+		// set testing mode to limit requests
+		apiClient.Context.Map.Set("testing", true)
+
+		if err := apiClient.Authenticate(); err != nil {
+			return ok, g.Error(err, "could not authenticate to %s", c.Name)
+		}
+
+		var testEndpoints, testedEndpoints []string
+		if val := os.Getenv("SLING_TEST_ENDPOINTS"); val != "" {
+			testEndpoints = strings.Split(os.Getenv("SLING_TEST_ENDPOINTS"), ",")
+		}
+
+		endpoints, err := apiClient.ListEndpoints()
+		if err != nil {
+			return ok, g.Error(err, "could not list endpoints")
+		}
+
+		limit := cast.ToInt(g.Getenv("SLING_TEST_ENDPOINT_LIMIT", "10"))
+		if limit > 1000 {
+			limit = 1000 // let's set the max limit to 1000 for testing
+		}
+		if g.Getenv("SLING_TEST_ENDPOINT_LIMIT") == "" {
+			g.Debug(env.MagentaString(g.F("testing endpoints with a record limit: %d. Set env var SLING_TEST_ENDPOINT_LIMIT to modify.", limit)))
+		}
+
+		maxRequests := cast.ToInt(g.Getenv("SLING_TEST_ENDPOINT_MAX_REQUESTS", "2"))
+		if maxRequests == 0 {
+			maxRequests = 3
+		}
+
+		apiClient.Context.Map.Set("max_requests", maxRequests)
+		if g.Getenv("SLING_TEST_ENDPOINT_MAX_REQUESTS") == "" {
+			g.Debug(env.MagentaString(g.F("testing endpoints with a max requests: %d. Set env var SLING_TEST_ENDPOINT_MAX_REQUESTS to modify.", maxRequests)))
+		}
+
+		// obtain the best endpoint for testing one (for connectivity/authentication)
+		if cast.ToBool(g.Getenv("SLING_TEST_SINGLE_ENDPOINT")) {
+			testEndpoints = []string{apiClient.GetTestEndpoint()}
+		}
+
+		for _, endpoint := range endpoints {
+			// check for match to test (if provided)
+			allowTest := len(testEndpoints) == 0
+			for _, testEndpoint := range testEndpoints {
+				if strings.EqualFold(testEndpoint, endpoint.Name) {
+					allowTest = true
+				}
+			}
+			if !allowTest {
+				continue
+			}
+
+			println()
+			g.Info("testing endpoint: %#v", endpoint.Name)
+			api.FireSpecEvent(g.M("type", "endpoint-start", "endpoint", endpoint.Name))
+			testedEndpoints = append(testedEndpoints, endpoint.Name)
+
+			// set limits for testing
+			options := api.APIStreamConfig{Flatten: 1, Limit: limit}
+
+			// set context if provided
+			contextPayload := cast.ToString(g.Getenv("SLING_TEST_ENDPOINT_CONTEXT"))
+			if contextPayload != "" {
+				contextMap := g.M()
+				if err := g.Unmarshal(contextPayload, &contextMap); err != nil {
+					g.Warn("could not set context for spec testing: %s", err.Error())
+				}
+
+				// set store
+				if store, ok := contextMap["store"]; ok && store != "" {
+					storeMap, err := g.UnmarshalMap(cast.ToString(store))
+					if err != nil {
+						g.Warn("could not unmarshal context store: %s", err.Error())
+					}
+					apiClient.SetReplicationStore(storeMap)
+				}
+
+				// set range & mode
+				options.Range = cast.ToString(contextMap["range"])
+				options.Mode = cast.ToString(contextMap["mode"])
+			}
+
+			df, err := apiClient.ReadDataflow(endpoint.Name, options)
+			if err != nil {
+				return ok, g.Error(err, "error testing endpoint: %s", endpoint.Name)
+			}
+
+			data, err := df.Collect()
+			if err != nil {
+				return ok, g.Error(err, "could collect data from endpoint: %s", endpoint.Name)
+			}
+
+			g.Debug("   got %d records from endpoint: %s", len(data.Rows), endpoint.Name)
+			api.FireSpecEvent(g.M("type", "endpoint-done", "endpoint", endpoint.Name, "record_count", len(data.Rows)))
+
+			records := data.Records(false)
+			if len(records) > 0 {
+				record := records[0]
+				g.Debug("   columns = %s", g.Marshal(lo.Keys(record)))
+			}
+
+		}
+
+		for _, testEndpoint := range testEndpoints {
+			tested := false
+			for _, testedEndpoint := range testedEndpoints {
+				if strings.EqualFold(testedEndpoint, testEndpoint) {
+					tested = true
+				}
+			}
+			if !tested {
+				g.Warn(`did not test endpoint "%s" (not found)`, testEndpoint)
+			}
+		}
+
+	}
+
+	return true, nil
+}
+
+type DiscoverOptions struct {
+	Pattern   string                 `json:"pattern,omitempty"`
+	Level     database.SchemataLevel `json:"level,omitempty"`
+	Recursive bool                   `json:"recursive,omitempty"`
+}
+
+func (c *Connection) Discover(opt *DiscoverOptions) (ok bool, nodes filesys.FileNodes, schemata database.Schemata, endpoints api.Endpoints, err error) {
+
+	patterns := []string{}
+	globPatterns := []glob.Glob{}
+
+	parsePattern := func() {
+		if opt.Pattern != "" {
+			patterns = []string{}
+			globPatterns = []glob.Glob{}
+			for _, f := range strings.Split(opt.Pattern, "|") {
+				patterns = append(patterns, f)
+				gc, err := glob.Compile(f)
+				if err == nil {
+					globPatterns = append(globPatterns, gc)
+				}
+			}
+		}
+	}
+
+	parsePattern()
+
+	if opt.Pattern != "" && len(patterns) == 1 {
+		if strings.Contains(opt.Pattern, "**") || strings.Contains(opt.Pattern, "*/*") {
+			opt.Recursive = true
+		}
+	}
+
+	switch {
+	case c.Type.IsDb():
+		dbConn, err := c.AsDatabase(AsConnOptions{UseCache: c.GetType() == dbio.TypeDbDuckDb})
+		if err != nil {
+			return ok, nodes, schemata, endpoints, g.Error(err, "could not initiate %s", c.Name)
+		}
+		err = dbConn.Connect(10)
+		if err != nil {
+			return ok, nodes, schemata, endpoints, g.Error(err, "could not connect to %s", c.Name)
+		}
+
+		var table database.Table
+		schemaHadWildcard := false
+		level := database.SchemataLevelSchema
+		if opt.Pattern != "" {
+			level = database.SchemataLevelTable
+			table, _ = database.ParseTableName(opt.Pattern, c.Type)
+			if strings.Contains(table.Schema, "*") || strings.Contains(table.Schema, "?") {
+				schemaHadWildcard = true
+				table.Schema = ""
+			}
+			if strings.Contains(table.Name, "*") || strings.Contains(table.Name, "?") {
+				table.Name = ""
+			}
+		}
+
+		if string(opt.Level) == "" {
+			opt.Level = level
+		}
+
+		g.Debug("database discover inputs: %s", g.Marshal(g.M("pattern", opt.Pattern, "schema", table.Schema, "table", table.Name, "level", opt.Level)))
+
+		schemata, err = dbConn.GetSchemata(opt.Level, table.Schema, table.Name)
+		if err != nil {
+			return ok, nodes, schemata, endpoints, g.Error(err, "could not discover %s", c.Name)
+		}
+
+		if opt.Level == database.SchemataLevelColumn {
+			g.Debug("unfiltered column records returned: %d", len(schemata.Columns()))
+			if len(schemata.Columns()) <= 15 {
+				g.Debug(g.Marshal(lo.Keys(schemata.Columns())))
+			}
+		} else {
+			g.Debug("unfiltered table records returned: %d", len(schemata.Tables()))
+			if len(schemata.Tables()) <= 15 {
+				g.Debug(g.Marshal(lo.Keys(schemata.Tables())))
+			}
+		}
+
+		// apply filter if table is not specified
+		if len(patterns) > 0 && (table.Name == "" || schemaHadWildcard) {
+			schemata = schemata.Filtered(opt.Level == database.SchemataLevelColumn, patterns...)
+		}
+
+	case c.Type.IsFile():
+		fileClient, err := c.AsFile(AsConnOptions{UseCache: false})
+		if err != nil {
+			return ok, nodes, schemata, endpoints, g.Error(err, "could not initiate %s", c.Name)
+		}
+
+		parent, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		defer cancel()
+
+		err = fileClient.Init(parent)
+		if err != nil {
+			return ok, nodes, schemata, endpoints, g.Error(err, "could not connect to %s", c.Name)
+		}
+
+		url := c.URL()
+		if opt.Pattern != "" {
+			url = opt.Pattern
+		}
+
+		if strings.Contains(url, "*") || strings.Contains(url, "?") {
+			opt.Pattern = url
+			url = filesys.GetDeepestParent(url)
+			parsePattern()
+		}
+
+		g.Debug("file discover inputs: %s", g.Marshal(g.M("pattern", opt.Pattern, "url", url, "column_level", opt.Level, "recursive", opt.Recursive)))
+		if opt.Recursive {
+			nodes, err = fileClient.ListRecursive(url)
+		} else {
+			nodes, err = fileClient.List(url)
+		}
+		if err != nil {
+			return ok, nodes, schemata, endpoints, g.Error(err, "could not connect to %s", c.Name)
+		}
+		g.Debug("unfiltered nodes returned: %d", len(nodes))
+		if len(nodes) <= 20 {
+			g.Debug(g.Marshal(nodes.Paths()))
+		}
+
+		// apply filter
+		// sort alphabetically
+		nodes.Sort()
+		nodes = lo.Filter(nodes, func(n filesys.FileNode, i int) bool {
+			if len(patterns) == 0 || !(strings.Contains(opt.Pattern, "*") || strings.Contains(opt.Pattern, "?")) {
+				return true
+			}
+			for _, gf := range globPatterns {
+				if gf.Match(strings.TrimSuffix(n.Path(), "/")) {
+					return true
+				}
+			}
+			return false
+		})
+
+		// if single file, get columns of file content
+		if opt.Level == database.SchemataLevelColumn {
+			ctx := g.NewContext(fileClient.Context().Ctx, 5)
+
+			getColumns := func(i int) {
+				defer ctx.Wg.Read.Done()
+				node := nodes[i]
+
+				df, err := fileClient.ReadDataflow(node.URI, iop.FileStreamConfig{Limit: 100})
+				if err != nil {
+					ctx.CaptureErr(g.Error(err, "could not read file content of %s", node.URI))
+					return
+				}
+
+				// discard rows, just need columns
+				for stream := range df.StreamCh {
+					for range stream.Rows() {
+					}
+				}
+
+				// get columns
+				nodes[i].Columns = df.Columns
+			}
+
+			for i := range nodes {
+				ctx.Wg.Read.Add()
+				go getColumns(i)
+
+				if i+1 >= 15 {
+					g.Warn("limiting the number of read ops for files (15 files already read)")
+					break
+				}
+			}
+			ctx.Wg.Read.Wait()
+
+			if err = ctx.Err(); err != nil {
+				return ok, nodes, schemata, endpoints, g.Error(err, "could not read files")
+			}
+		}
+
+	case c.Type.IsAPI():
+		apiConn, err := c.AsAPI(AsConnOptions{UseCache: false})
+		if err != nil {
+			return ok, nodes, schemata, endpoints, g.Error(err, "could not initiate %s", c.Name)
+		}
+
+		endpoints, err = apiConn.ListEndpoints(opt.Pattern)
+		if err != nil {
+			return ok, nodes, schemata, endpoints, g.Error(err, "could not list endpoints from: %s", c.Name)
+		}
+
+	default:
+		return ok, nodes, schemata, endpoints, g.Error("Unhandled connection type: %s", c.Type)
+	}
+
+	ok = true
+
+	return
+}

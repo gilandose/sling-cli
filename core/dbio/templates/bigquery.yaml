@@ -1,0 +1,631 @@
+core:
+  drop_table: drop table if exists {table}
+  drop_view: drop view if exists {view}
+  drop_index: "select 'indexes do not apply for bigquery'"
+  create_schema: create schema if not exists {schema}
+  create_table: create table {table} ({col_types}) {partition_by} {cluster_by}
+  create_index: "select 'indexes do not apply for bigquery'"
+  insert: insert into {table} ({fields}) values ({values})
+  update: update {table} set {set_fields} where {pk_fields_equal}
+  # alter_columns: alter table {table} alter column {col_ddl}
+  # modify_column: '{column} set data type {type}'
+  alter_columns: |
+    create or replace table {table} as
+    select * replace({col_ddl})
+    from {table}
+  modify_column: 'cast({column} as {type}) as {column}'
+  # column_names: select * from ({sql}) as t limit 1
+  copy_to_gcs: |
+      EXPORT DATA OPTIONS(
+        uri = '{gcs_path}',
+        format = 'CSV',
+        overwrite = true,
+        header = true,
+        field_delimiter = ',',
+        compression = 'GZIP'
+      ) AS (
+        {sql}
+      )
+
+  copy_to_gcs_parquet: |
+      EXPORT DATA OPTIONS(
+        uri = '{gcs_path}',
+        format = 'PARQUET',
+        overwrite = true,
+        compression = 'GZIP'
+      ) AS (
+        {sql}
+      )
+
+  # BigQuery supports all 4 merge strategies
+  merge_insert: |
+    INSERT INTO {tgt_table} ({insert_fields})
+    SELECT {src_fields} FROM {src_table} src
+    WHERE NOT EXISTS (
+      SELECT 1 FROM {tgt_table} tgt WHERE {src_tgt_pk_equal}
+    )
+
+  merge_update: |
+    UPDATE {tgt_table} tgt
+    SET {set_fields}
+    FROM {src_table} src
+    WHERE {src_tgt_pk_equal}
+
+  merge_update_insert: |
+    MERGE INTO {tgt_table} tgt
+    USING (SELECT {src_fields} FROM {src_table}) src
+    ON ({src_tgt_pk_equal})
+    WHEN MATCHED THEN UPDATE SET {set_fields}
+    WHEN NOT MATCHED THEN INSERT ({insert_fields}) VALUES ({src_insert_fields})
+
+  merge_delete_insert: |
+    DELETE FROM {tgt_table} tgt
+    WHERE EXISTS (
+      SELECT 1 FROM {src_table} src
+      WHERE {src_tgt_pk_equal}
+    );
+    INSERT INTO {tgt_table} ({insert_fields})
+    SELECT {src_fields} FROM {src_table} src
+
+  merge_change_capture: |
+    DELETE FROM {tgt_table} tgt
+    WHERE EXISTS (
+      SELECT 1 FROM (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
+        FROM {src_table}
+      ) src
+      WHERE src._rn = 1 AND src._sling_synced_op = 'D'
+      AND {src_tgt_pk_equal}
+    );
+    MERGE INTO {tgt_table} tgt
+    USING (
+      SELECT * FROM (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
+        FROM {src_table}
+        WHERE _sling_synced_op != 'D'
+      ) sub WHERE _rn = 1
+    ) src
+    ON ({src_tgt_pk_equal})
+    WHEN MATCHED THEN UPDATE SET {set_fields}
+    WHEN NOT MATCHED THEN INSERT ({insert_fields}) VALUES ({src_insert_fields})
+
+  merge_change_capture_soft: |
+    UPDATE {tgt_table} tgt SET _sling_synced_at = CURRENT_TIMESTAMP, _sling_synced_op = 'D'
+    WHERE _sling_synced_op != 'D'
+    AND EXISTS (
+      SELECT 1 FROM (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
+        FROM {src_table}
+      ) src
+      WHERE src._rn = 1 AND src._sling_synced_op = 'D'
+      AND {src_tgt_pk_equal}
+    );
+    MERGE INTO {tgt_table} tgt
+    USING (
+      SELECT * FROM (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY {pk_fields} ORDER BY _sling_cdc_seq DESC) as _rn
+        FROM {src_table}
+        WHERE _sling_synced_op != 'D'
+      ) sub WHERE _rn = 1
+    ) src
+    ON ({src_tgt_pk_equal})
+    WHEN MATCHED THEN UPDATE SET {set_fields}
+    WHEN NOT MATCHED THEN INSERT ({insert_fields}) VALUES ({src_insert_fields})
+
+  # Foreign key DDL template (BigQuery - declarative, NOT ENFORCED required)
+  add_foreign_key: |
+    ALTER TABLE {table} ADD CONSTRAINT {constraint} FOREIGN KEY ({column}) REFERENCES {ref_table}({ref_column}) NOT ENFORCED
+
+  # Column comment/description template (BigQuery uses ALTER COLUMN SET OPTIONS)
+  add_column_comment: ALTER TABLE {table} ALTER COLUMN `{column}` SET OPTIONS (description={comment})
+
+  # Table comment/description template (BigQuery uses ALTER TABLE SET OPTIONS)
+  add_table_comment: ALTER TABLE {table} SET OPTIONS (description={comment})
+
+metadata:
+
+  current_database:
+    select current_database()
+  
+  databases:
+    show projects
+  
+  schemas: |
+    select schema_name
+    from INFORMATION_SCHEMA.SCHEMATA
+    order by schema_name
+    
+  tables: |
+    select '{schema}' as schema_name, table_name, 'false' as is_view
+    from `{schema}`.INFORMATION_SCHEMA.TABLES
+    where table_type = 'BASE TABLE'
+    order by table_schema, table_name
+    
+  views: |
+    select '{schema}' as schema_name, table_name, 'true' as is_view
+    from `{schema}`.INFORMATION_SCHEMA.TABLES
+    where table_type = 'VIEW'
+    order by table_schema, table_name
+
+  columns: |
+    select column_name, data_type
+    from `{schema}`.INFORMATION_SCHEMA.COLUMNS
+    where table_name = '{table}'
+    order by ordinal_position  
+  
+  columns_full: |
+    with tables as (
+      select
+        table_catalog,
+        table_schema,
+        table_name,
+        case table_type
+          when 'VIEW' then true
+          else false
+        end as is_view
+      from `{schema}`.INFORMATION_SCHEMA.TABLES
+      where table_name = '{table}'
+    )
+    select
+      cols.table_schema as schema_name,
+      cols.table_name as table_name,
+      cols.column_name as column_name,
+      cols.data_type as data_type,
+      cols.ordinal_position as position
+    from `{schema}`.INFORMATION_SCHEMA.COLUMNS cols
+    join tables
+      on tables.table_catalog = cols.table_catalog
+      and tables.table_schema = cols.table_schema
+      and tables.table_name = cols.table_name
+    order by cols.table_catalog, cols.table_schema, cols.table_name, cols.ordinal_position
+
+  schemata: |
+    with tables as (
+      select
+        table_catalog,
+        table_schema,
+        table_name,
+        case table_type
+          when 'VIEW' then true
+          else false
+        end as is_view
+      from `{schema}`.INFORMATION_SCHEMA.TABLES
+      where 1=1
+        {{if .schema -}} and table_schema = '{schema}' {{- end}}
+        {{if .tables -}} and table_name in ({tables}) {{- end}}
+    )
+    select
+      cols.table_schema as schema_name,
+      cols.table_name as table_name,
+      tables.is_view as is_view,
+      cols.column_name as column_name,
+      cols.data_type as data_type,
+      cols.ordinal_position as position
+    from `{schema}`.INFORMATION_SCHEMA.COLUMNS cols
+    join tables
+      on tables.table_catalog = cols.table_catalog
+      and tables.table_schema = cols.table_schema
+      and tables.table_name = cols.table_name
+    order by cols.table_catalog, cols.table_schema, cols.table_name, cols.ordinal_position
+  
+  sessions:
+    select *
+    from pg_stat_activity
+    where state = 'active'
+
+  session_terminate:
+    select pg_terminate_backend({pid})
+
+  # Extended column attributes for schema migration
+  # Note: BigQuery does not support IDENTITY columns
+  # Uses INFORMATION_SCHEMA.COLUMNS (not COLUMN_FIELD_PATHS which expands nested types)
+  columns_extended: |
+    SELECT
+      c.column_name,
+      CASE WHEN c.is_nullable = 'YES' THEN 'true' ELSE 'false' END AS is_nullable,
+      CAST(NULL AS STRING) AS default_value,
+      'false' AS is_auto_increment,
+      CAST(NULL AS STRING) AS identity_seed,
+      CAST(NULL AS STRING) AS identity_increment,
+      CASE WHEN pk.column_name IS NOT NULL THEN 'true' ELSE 'false' END AS is_primary_key,
+      cf.description
+    FROM `{schema}`.INFORMATION_SCHEMA.COLUMNS c
+    LEFT JOIN `{schema}`.INFORMATION_SCHEMA.COLUMN_FIELD_PATHS cf
+      ON cf.table_name = c.table_name AND cf.column_name = c.column_name
+    LEFT JOIN (
+      SELECT kcu.column_name
+      FROM `{schema}`.INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+      JOIN `{schema}`.INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
+        ON tc.constraint_name = kcu.constraint_name
+      WHERE tc.constraint_type = 'PRIMARY KEY'
+        AND tc.table_name = '{table}'
+    ) pk ON pk.column_name = c.column_name
+    WHERE c.table_name = '{table}'
+    ORDER BY c.ordinal_position
+
+  # Indexes metadata - BigQuery doesn't support traditional indexes
+  indexes: |
+    SELECT
+      CAST(NULL AS STRING) AS index_name,
+      CAST(NULL AS STRING) AS column_name
+    WHERE FALSE
+
+  # Foreign key relationships
+  foreign_keys: |
+    SELECT
+      tc.constraint_name,
+      kcu.column_name,
+      ccu.table_schema AS referenced_schema,
+      ccu.table_name AS referenced_table,
+      ccu.column_name AS referenced_column,
+      'NO ACTION' AS on_delete,
+      'NO ACTION' AS on_update
+    FROM `{schema}`.INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+    JOIN `{schema}`.INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
+      ON tc.constraint_name = kcu.constraint_name
+    JOIN `{schema}`.INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE ccu
+      ON tc.constraint_name = ccu.constraint_name
+    WHERE tc.constraint_type = 'FOREIGN KEY'
+      AND tc.table_name = '{table}'
+    ORDER BY tc.constraint_name, kcu.ordinal_position
+
+  # Extended table attributes for schema migration
+  table_extended: |
+    SELECT option_value AS description
+    FROM `{schema}`.INFORMATION_SCHEMA.TABLE_OPTIONS
+    WHERE table_name = '{table}' AND option_name = 'description'
+
+analysis:
+  # table level
+  table_count: |
+    -- table_count {table}
+    select
+      '{schema}' as schema_nm,
+      '{table}' as table_nm,
+      count(*) cnt
+    from `{schema}`.`{table}`
+
+  field_chars: |
+    -- field_chars {field}
+    select
+      '{schema}' as schema_nm,
+      '{table}' as table_nm,
+      '{field}' as field,
+      sum(case when regexp_like({field}, '\\n') then 1 else 0 end) as cnt_nline,
+      sum(case when regexp_like({field}, '\\t') then 1 else 0 end) as cnt_tab,
+      sum(case when regexp_like({field}, ',') then 1 else 0 end) as cnt_comma,
+      sum(case when regexp_like({field}, '"') then 1 else 0 end) as cnt_dquote
+    from `{schema}`.`{table}`
+
+  field_pk_test: |
+    -- field_pk_test {field}
+    select
+      '`{schema}`.`{table}`' as table_nm,
+      case when count(*) = count(distinct {field}) then 'PASS' else 'FAIL' end as result,
+      count(*) as tot_cnt,
+      count(distinct {field}) as dstct_cnt
+    from `{schema}`.`{table}`
+
+  field_stat: |
+    -- field_stat {field}
+    select
+      '{schema}' as schema_nm,
+      '{table}' as table_nm,
+      '{field}' as field,
+      count(*) as tot_cnt,
+      count({field}) as f_cnt,
+      count(*) - count({field}) as f_null_cnt,
+      round(100.0 * (count(*) - count({field})) / count(*), 1) as f_null_prct,
+      count(distinct {field}) as f_dstct_cnt,
+      round(100.0 * count(distinct {field}) / count(*), 1) as f_dstct_prct,
+      count(*) - count(distinct {field}) as f_dup_cnt
+    from `{schema}`.`{table}`
+
+  field_stat_group: |
+    -- field_stat_group {field}
+    select
+      '{schema}' as schema_nm,
+      '{table}' as table_nm,
+      {group_expr} as group_exp,
+      '{field}' as field,
+      count(*) as tot_cnt,
+      count({field}) as f_cnt,
+      count(*) - count({field}) as f_null_cnt,
+      round(100.0 * (count(*) - count({field})) / count(*), 1) as f_null_prct,
+      count(distinct {field}) as f_dstct_cnt,
+      round(100.0 * count(distinct {field}) / count(*), 1) as f_dstct_prct,
+      count(*) - count(distinct {field}) as f_dup_cnt
+    from `{schema}`.`{table}`
+    group by {group_expr}
+
+  field_stat_len: |
+    -- field_stat_len {field}
+    select
+      '{schema}' as schema_nm,
+      '{table}' as table_nm,
+      '{field}' as field,
+      '{type}' as type,
+      count(*) as tot_cnt,
+      min(length(cast({field} as string))) as f_min_len,
+      max(length(cast({field} as string))) as f_max_len
+    from `{schema}`.`{table}`
+
+  
+  field_stat_deep: |
+    -- field_stat_deep {field}
+    select
+      '{schema}' as schema_nm,
+      '{table}' as table_nm,
+      '{field}' as field,
+      '{type}' as type,
+      count(*) as tot_cnt,
+      count({field}) as f_cnt,
+      count(*) - count({field}) as f_null_cnt,
+      round(100.0 * (count(*) - count({field})) / count(*), 1) as f_null_prct,
+      count(distinct {field}) as f_dstct_cnt,
+      round(100.0 * count(distinct {field}) / count(*), 1) as f_dstct_prct,
+      count(*) - count(distinct {field}) as f_dup_cnt,
+      cast(min({field}) as string) as f_min,
+      cast(max({field}) as string) as f_max,
+      min(length({field})) as f_min_len,
+      max(length({field})) as f_max_len
+    from `{schema}`.`{table}`
+
+  fill_cnt_group_field: |
+    -- fill_cnt_group_field {field}
+    select
+      {field},
+      {columns_sql}
+    from `{schema}`.`{table}`
+    group by {field}
+    order by {field}
+
+  fill_rate_group_field: |
+    -- fill_rate_group_field {field}
+    select
+      {field},
+      {fill_rate_fields_sql}
+    from `{schema}`.`{table}`
+    group by {field}
+    order by {field}
+
+  distro_field: |
+    -- distro_field {field}
+    with t1 as (
+      select
+        '{field}' as field,
+        {field},
+        count(*) cnt
+      from `{schema}`.`{table}`
+      group by {field}
+      order by count(*) desc
+    )
+    , t2 as (
+      select
+        '{field}' as field,
+        count(*) ttl_cnt
+      from `{schema}`.`{table}`
+    )
+    select
+      '{table}' as table_nm,
+      t1.field,
+      {field} as value,
+      cnt,
+      round(100.0 * cnt / ttl_cnt, 2) as prct
+    from t1
+    join t2
+      on t1.field = t2.field
+    order by cnt desc
+
+  distro_field_group: |
+    -- distro_field_group {field}
+    with t1 as (
+      select
+        '{field}' as field,
+        {group_expr} as group_exp,
+        {field},        
+        count(*) cnt
+      from `{schema}`.`{table}`
+      group by {field}, {group_expr}
+      order by count(*) desc
+    )
+    , t2 as (
+      select
+        '{field}' as field,
+        count(*) ttl_cnt
+      from `{schema}`.`{table}`
+    )
+    select
+      '{table}' as table_nm,
+      t1.field,
+      t1.group_exp,
+      {field} as value,
+      cnt,
+      round(100.0 * cnt / ttl_cnt, 2) as prct
+    from t1
+    join t2
+      on t1.field = t2.field
+    order by cnt desc
+
+  distro_field_date: |
+    -- distro_field_date {field}
+    with t1 as (
+        select
+          '{field}' as field,
+          extract(year from {field}) as year,
+          extract(month from {field}) as month,
+          extract(day from {field}) as day,
+          count(*) cnt
+        from `{schema}`.`{table}`
+        group by 2, 3, 4
+        order by 2, 3, 4
+      )
+      , t2 as (
+        select '{field}' as field, count(*) ttl_cnt
+        from `{schema}`.`{table}`
+      )
+      select 
+        '{schema}' as schema_nm,
+        '{table}' as table_nm,
+        t1.field,
+        t1.year,
+        t1.month,
+        t1.day,
+        cnt,
+        round(100.0 * cnt / ttl_cnt, 2) as prct
+      from t1
+      join t2
+        on t1.field = t2.field
+      order by t1.year, t1.month, t1.day
+
+  distro_field_date_wide: |
+    -- distro_field_date {table}
+    select
+      '{date_field}' as date_field,
+      year({date_field}) as year,
+      month({date_field}) as month,
+      {columns_sql}
+    from `{schema}`.`{table}`
+    {where_clause}
+    group by year({date_field}), month({date_field})
+    order by year({date_field}), month({date_field})
+
+  test_pk: |
+    select
+      '`{schema}`.`{table}`' as table_nm,
+      '{fields_exp}' as expression,
+      case when count(*) = count(distinct {fields_exp}) then 'PASS' else 'FAIL' end as pk_result,
+      count(*) as tot_cnt,
+      count(distinct {fields_exp}) as expression_cnt,
+      count(*) - count(distinct {fields_exp}) as delta_cnt,
+      sum(case when {fields_exp} is null then 1 else 0 end) as null_cnt
+    from `{schema}`.`{table}`
+    {where_clause}
+
+routine:
+  number_min_max: |
+    select
+      count(*) as tot_cnt,
+      count({field}) as field_cnt,
+      min({field}) as min_val,
+      max({field}) as max_val
+    from `{schema}`.`{table}`
+
+  number_trunc_min_max: |
+    select
+      {fields}
+    from `{schema}`.`{table}`
+    where {where}
+      (({partition_col_trunc} >= '{min_val}'
+      and {partition_col_trunc} <= '{max_val}')
+      {or_null})
+
+  date_trunc_uniques: |
+    select
+      {partition_col_trunc} as day_field,
+      count(*) cnt
+    from `{schema}`.`{table}`
+    {where}
+    group by {partition_col_trunc}
+    order by {partition_col_trunc}
+
+  number_trunc_uniques: |
+    select
+      {partition_col_trunc} as trunc_field,
+      count(*) cnt
+    from `{schema}`.`{table}`
+    {where}
+    group by {partition_col_trunc}
+    order by {partition_col_trunc}
+
+function:
+  replace: replace({string_expr}, {to_replace}, {replacement})
+  str_utf8: '{ field }'
+  string_type: string
+  cast_to_string: cast({field} as string)
+  cast_to_text: cast({field} as string)
+  fill_cnt_field: count({field}) as cnt_{field}
+  fill_rate_field: round(100.0 * count({field}) / count(*), 2) as prct_{field}
+  checksum_date: cast(unix_micros(cast({field} as timestamp)) as numeric)
+  checksum_datetime: cast(unix_micros({field}) as numeric)
+  checksum_boolean: 'length(cast({field} as string))'
+  checksum_json: "length(replace(nullif(to_json_string({field}), 'null'), ' ', ''))"
+
+variable:
+  # BigQuery default is delete_insert as it's more reliable
+  default_merge_strategy: delete_insert
+  tmp_folder: /tmp
+  bind_string: "?"
+  quote_char: '`'
+  error_filter_table_exists: duplicate
+  multi_exec_delay: 2 # https://cloud.google.com/bigquery/quotas#data-manipulation-language-statements
+  max_string_type: string
+  max_string_length: 2621440
+
+error_filter:
+  table_not_exist: exist
+
+native_type_map:
+  array: json
+  bignumeric: decimal
+  bool: bool
+  boolean: bool
+  bytes: binary
+  date: date
+  datetime: datetime
+  float: float
+  float64: float
+  geography: string
+  int64: bigint
+  integer: bigint
+  json: json
+  numeric: decimal
+  record: json
+  string: text
+  struct: json
+  time: time
+  timestamp: timestamp
+
+general_type_map:
+  bigint: int64
+  binary: bytes
+  bool: bool
+  date: date
+  datetime: timestamp
+  decimal: numeric
+  float: float64
+  integer: int64
+  json: json
+  smallint: int64
+  string: string
+  text: string
+  time: string
+  timestamp: timestamp
+  timestampz: timestamp
+  timez: string
+  uuid: string
+
+# Schema migration: default value translation between native and generalized forms
+# Note: BigQuery has limited default value support
+default_value_map:
+  to_general:
+    "CURRENT_TIMESTAMP()": "current_timestamp"
+    "CURRENT_TIMESTAMP": "current_timestamp"
+    "CURRENT_DATE()": "current_date"
+    "CURRENT_DATE": "current_date"
+    "CURRENT_TIME()": "current_time"
+    "CURRENT_TIME": "current_time"
+    "GENERATE_UUID()": "uuid()"
+    "true": "true"
+    "false": "false"
+    "TRUE": "true"
+    "FALSE": "false"
+  from_general:
+    "current_timestamp": "CURRENT_TIMESTAMP()"
+    "current_timestamp_utc": "CURRENT_TIMESTAMP()"
+    "current_date": "CURRENT_DATE()"
+    "current_time": "CURRENT_TIME()"
+    "uuid()": "GENERATE_UUID()"
+    "true": "TRUE"
+    "false": "FALSE"
+    "null": "NULL"

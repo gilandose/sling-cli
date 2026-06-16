@@ -1,0 +1,1206 @@
+# Test cases for API HTTP calls and response extraction
+# Each test case validates different aspects of the API framework
+
+- id: 1
+  name: extract_pagination_id_from_response
+  mock_response:
+    pagination:
+      id: abc123
+      hasMore: true
+      total: 100
+    data:
+      - id: 1
+        name: Item 1
+      - id: 2
+        name: Item 2
+  spec:
+    name: test_api
+    authentication:
+      type: none
+    endpoints:
+      test_endpoint:
+        name: test_endpoint
+        response:
+          processors:
+            - expression: response.json.pagination.id
+              output: state.next_page_id
+              aggregation: last
+          records:
+            jmespath: data
+  expected_records:
+    - id: "1"
+      name: Item 1
+    - id: "2"
+      name: Item 2
+  expected_state:
+    next_page_id: abc123
+  expected_next_state: {}
+
+- id: 2
+  name: extract_records_with_jmespath_filter
+  mock_response:
+    data:
+      items:
+        - id: 1
+          name: Active Item
+          active: true
+        - id: 2
+          name: Inactive Item
+          active: false
+        - id: 3
+          name: Another Active
+          active: true
+  spec:
+    name: test_api
+    authentication:
+      type: none
+    endpoints:
+      test_endpoint:
+        name: test_endpoint
+        response:
+          records:
+            jmespath: "data.items[?active==`true`]"
+  expected_records:
+    - id: "1"
+      name: Active Item
+      active: "true"
+    - id: "3"
+      name: Another Active
+      active: "true"
+  expected_state: {}
+  expected_next_state: {}
+
+- id: 3
+  name: onestock_style_response
+  mock_response:
+    pagination:
+      id: cursor_xyz789
+      limit: 50
+      hasMore: false
+    items:
+      - id: 1
+        status: shipped
+        createdAt: "2025-01-10"
+      - id: 2
+        status: pending
+        createdAt: "2025-01-11"
+  spec:
+    name: test_api
+    authentication:
+      type: none
+    endpoints:
+      test_endpoint:
+        name: test_endpoint
+        request:
+          parameters:
+            cursor: "{state.page_cursor}"
+        response:
+          processors:
+            - expression: response.json.pagination.id
+              output: state.cursor
+              aggregation: last
+            - expression: response.json.pagination.limit
+              output: state.limit
+              aggregation: last
+          records:
+            jmespath: items
+        pagination:
+          stop_condition: "response.json.pagination.hasMore == false"
+          next_state:
+            page_cursor: "{state.cursor}"
+            id: "{response.json.pagination.id}"
+  expected_records:
+    - id: 1
+      status: shipped
+      createdAt: "2025-01-10"
+    - id: 2
+      status: pending
+      createdAt: "2025-01-11"
+  expected_state:
+    cursor: cursor_xyz789
+    limit: 50
+  expected_next_state:
+    page_cursor: cursor_xyz789
+    id: cursor_xyz789
+
+- id: 4
+  name: test_nextstate_rendering_with_mixed_sources
+  mock_response:
+    meta:
+      next_cursor: next_page_123
+      page_size: 25
+      total: 150
+    results:
+      - id: rec1
+        value: 100
+        year: 2025
+      - id: rec2
+        value: 200
+        year: 2025
+  spec:
+    name: test_api
+    authentication:
+      type: none
+    endpoints:
+      test_endpoint:
+        name: test_endpoint
+        state:
+          base_url: https://api.example.com
+          version: v2
+        request:
+          parameters:
+            cursor: "{state.cursor}"
+        response:
+          processors:
+            - expression: response.json.meta.next_cursor
+              output: state.next_cursor
+              aggregation: last
+            - expression: response.json.meta.page_size
+              output: state.page_size
+              aggregation: last
+            - expression: >
+                object(
+                  "id", record.id,
+                  "value", record.value,
+                  "year", 2025
+                )
+              output: record
+          records:
+            jmespath: results
+        pagination:
+          stop_condition: response.json.meta.next_cursor == "next_page_123"
+          next_state:
+            cursor: "{state.next_cursor}"
+            limit: "{state.page_size}"
+            endpoint: "{state.base_url}/{state.version}/data"
+            total: "{response.json.meta.total}"
+  expected_records:
+    - id: rec1
+      value: "100"
+    - id: rec2
+      value: "200"
+  expected_state:
+    base_url: https://api.example.com
+    version: v2
+    next_cursor: next_page_123
+    page_size: 25
+  expected_next_state:
+    cursor: next_page_123
+    limit: 25
+    endpoint: https://api.example.com/v2/data
+    total: 150
+
+- id: 5
+  name: test_nextstate_with_functions
+  mock_response:
+    pagination:
+      next_token: token_456
+      has_more: true
+      per_page: null  # null value to test coalesce
+    data:
+      - id: 1
+        created: "2025-01-10T10:00:00Z"
+      - id: 2
+        created: "2025-01-10T11:00:00Z"
+      - id: 3
+        created: "2025-01-10T12:00:00Z"
+  spec:
+    name: test_api
+    authentication:
+      type: none
+    endpoints:
+      test_endpoint:
+        name: test_endpoint
+        state:
+          default_limit: 50
+          max_limit: 100
+          base_time: "2025-01-10T00:00:00Z"
+        request:
+          parameters:
+            token: "{state.token}"
+        response:
+          processors:
+            - expression: response.json.pagination.next_token
+              output: state.token
+              aggregation: last
+            - expression: response.json.pagination.has_more
+              output: state.has_more
+              aggregation: last
+            - expression: greatest(record.created)
+              output: state.max_created
+              aggregation: last
+          records:
+            jmespath: data
+        pagination:
+          stop_condition: '!state.has_more || is_null(state.token) || response.json.pagination.next_token == "token_456"'
+          next_state:
+            # Use coalesce to handle null per_page
+            limit: "{ coalesce(response.json.pagination.per_page, state.default_limit) }"
+            # Use if function for conditional logic
+            token: "{ if(state.has_more, state.token, null) }"
+            # Use date_add to calculate next time window
+            from_time: "{ date_add(state.max_created, 1, \"second\") }"
+            # Use least to ensure we don't exceed max_limit
+            safe_limit: "{ least(coalesce(response.json.pagination.per_page, state.default_limit), state.max_limit) }"
+            # Use string functions
+            token_prefix: "{ substring(state.token, 0, 5) }"
+            # Use encode_base64
+            encoded_token: "{ encode_base64(state.token) }"
+            # Complex expression with multiple functions
+            query_string: "{ join([\"limit=\", cast(least(state.default_limit, 100), \"string\"), \"&token=\", state.token], \"\") }"
+  expected_records:
+    - id: "1"
+      created: "2025-01-10T10:00:00Z"
+    - id: "2"
+      created: "2025-01-10T11:00:00Z"
+    - id: "3"
+      created: "2025-01-10T12:00:00Z"
+  expected_state:
+    default_limit: 50
+    max_limit: 100
+    base_time: "2025-01-10T00:00:00Z"
+    token: token_456
+    has_more: true
+    max_created: "2025-01-10T12:00:00Z"
+  expected_next_state:
+    limit: 50  # coalesce returns default_limit since per_page is nil
+    token: token_456  # if returns token since has_more is true
+    from_time: "2025-01-10T12:00:01Z"  # date_add adds 1 second
+    safe_limit: 50  # least(50, 100) = 50
+    token_prefix: token  # substring of "token_456"
+    encoded_token: dG9rZW5fNDU2  # base64 encoding of "token_456"
+    query_string: "limit=50&token=token_456"
+
+- id: 6
+  name: test_authentication_sequence_token_retrieval
+  mock_response:
+    # This will be the response for the main endpoint after authentication
+    data:
+      - order_id: "ERESA_000000001"
+        site_id: "store_123"
+        status: "shipped"
+        amount: 99.99
+      - order_id: "ERESA_000000002"
+        site_id: "store_123"
+        status: "pending"
+        amount: 149.5
+  spec:
+    name: onestock_api
+    description: "Test authentication sequence for token retrieval"
+    authentication:
+      type: sequence
+      sequence:
+        - request:
+            url: "/login"  # relative URL for test server
+            method: POST
+            payload:
+              site_id: "{secrets.site_id}"
+              user_id: "{secrets.user_id}"
+              password: "{secrets.password}"
+          response:
+            processors:
+              - expression: "response.json.token"
+                output: "state.token"
+                aggregation: last
+    endpoints:
+      test_endpoint:
+        description: "Order history endpoint"
+        request:
+          url: "/history"  # relative URL for test server
+          method: "GET"
+          headers:
+            Authorization: "Bearer {state.token}"
+          parameters:
+            site_id: "{secrets.site_id}"
+            order_id: "ERESA_000000003"
+        response:
+          records:
+            jmespath: data
+  expected_records:
+    - order_id: "ERESA_000000001"
+      site_id: store_123
+      status: shipped
+      amount: "99.99"
+    - order_id: "ERESA_000000002"
+      site_id: store_123
+      status: pending
+      amount: "149.5"
+  expected_state:
+    token: mock_token_12345
+  expected_next_state: {}
+
+- id: 7
+  name: test_setup_teardown_lifecycle
+  mock_response:
+    users:
+      - id: 1
+        name: "John Doe"
+        email: "john@example.com"
+      - id: 2
+        name: "Jane Smith"
+        email: "jane@example.com"
+    # Mock responses for setup and teardown
+    config:
+      api_version: "v2"
+      base_url: "https://api.example.com"
+      rate_limit: 100
+    cleanup:
+      status: "success"
+      message: "Session closed"
+  spec:
+    name: lifecycle_test_api
+    description: "Test setup and teardown lifecycle"
+    authentication:
+      type: none
+    endpoints:
+      test_endpoint:
+        description: "Main endpoint that uses setup state"
+        setup:
+          - request:
+              url: "/config"
+              method: GET
+            response:
+              processors:
+                - expression: "response.json.config.api_version"
+                  output: "state.api_version"
+                  aggregation: last
+                - expression: "response.json.config.base_url"
+                  output: "state.base_url"  
+                  aggregation: last
+                - expression: "response.json.config.rate_limit"
+                  output: "state.rate_limit"
+                  aggregation: last
+        teardown:
+          - request:
+              url: "/cleanup"
+              method: POST
+              payload:
+                session_id: "test_session"
+                api_version: "{state.api_version}"
+                total_users: 2
+            response:
+              processors:
+                - expression: "response.json.cleanup.status"
+                  output: "state.cleanup_status"
+                  aggregation: last
+        request:
+          url: "/users"
+          method: GET
+          headers:
+            X-API-Version: "{state.api_version}"
+            X-Base-URL: "{state.base_url}"
+          parameters:
+            limit: "{state.rate_limit}"
+        response:
+          records:
+            jmespath: users
+  expected_records:
+    - id: "1"
+      name: "John Doe"
+      email: "john@example.com"
+    - id: "2"
+      name: "Jane Smith"
+      email: "jane@example.com"
+  expected_state:
+    api_version: "v2"
+    base_url: "https://api.example.com"
+    rate_limit: 100
+  expected_next_state: {}
+
+- id: 8
+  name: test_authentication_with_expiry
+  mock_response:
+    products:
+      - id: 101
+        name: "Product A"
+        price: 29.99
+      - id: 102
+        name: "Product B"
+        price: 39.99
+  spec:
+    name: expiry_test_api
+    description: "Test authentication expiry functionality"
+    authentication:
+      type: sequence
+      expires: 3  # Auth expires after 3 seconds
+      sequence:
+        - request:
+            url: "/login"
+            method: POST
+            payload:
+              username: "{secrets.user_id}"
+              password: "{secrets.password}"
+          response:
+            processors:
+              - expression: "response.json.token"
+                output: "auth.token"
+                aggregation: last
+              - expression: "response.json.token"
+                output: "auth.headers.Authorization"
+                aggregation: last
+    endpoints:
+      test_endpoint:
+        description: "Products endpoint requiring authentication"
+        request:
+          url: "/products"
+          method: GET
+          headers:
+            Authorization: "Bearer {auth.token}"
+          parameters:
+            category: "electronics"
+        state:
+          request_count: 0
+        response:
+          records:
+            jmespath: products
+          processors:
+            - expression: "state.request_count + 1"
+              output: "state.request_count"
+              aggregation: last
+  expected_records:
+    - id: "101"
+      name: "Product A"
+      price: "29.99"
+    - id: "102"
+      name: "Product B"
+      price: "39.99"
+  expected_state:
+    request_count: 1
+  expected_next_state: {}
+
+- id: 9
+  name: test_csv_format_response
+  mock_response: |
+    id,name,email,age
+    1,John Doe,john@example.com,30
+    2,Jane Smith,jane@example.com,25
+    3,Bob Johnson,bob@example.com,35
+  spec:
+    name: csv_test_api
+    description: "Test CSV format response parsing"
+    authentication:
+      type: none
+    endpoints:
+      test_endpoint:
+        description: "Endpoint that returns CSV data"
+        request:
+          url: "/users"
+          method: GET
+        response:
+          format: csv
+          records:
+            jmespath: "@"
+  expected_records:
+    - id: "1"
+      name: "John Doe"
+      email: "john@example.com"
+      age: "30"
+    - id: "2"
+      name: "Jane Smith"
+      email: "jane@example.com"
+      age: "25"
+    - id: "3"
+      name: "Bob Johnson"
+      email: "bob@example.com"
+      age: "35"
+  expected_state: {}
+  expected_next_state: {}
+
+# - id: 10
+#   name: test_xml_format_response
+#   mock_response: |
+#     <?xml version="1.0" encoding="UTF-8"?>
+#     <users>
+#       <user>
+#         <id>1</id>
+#         <name>Alice Brown</name>
+#         <email>alice@example.com</email>
+#         <active>true</active>
+#       </user>
+#       <user>
+#         <id>2</id>
+#         <name>Charlie Davis</name>
+#         <email>charlie@example.com</email>
+#         <active>false</active>
+#       </user>
+#       <user>
+#         <id>3</id>
+#         <name>Diana Evans</name>
+#         <email>diana@example.com</email>
+#         <active>true</active>
+#       </user>
+#     </users>
+#   spec:
+#     name: xml_test_api
+#     description: "Test XML format response parsing"
+#     authentication:
+#       type: none
+#     endpoints:
+#       test_endpoint:
+#         description: "Endpoint that returns XML data"
+#         request:
+#           url: "/users"
+#           method: GET
+#         response:
+#           format: xml
+#           records:
+#             jmespath: "@"
+#   expected_records:
+#     - id: "1"
+#       name: "Alice Brown"
+#       email: "alice@example.com"
+#       active: "true"
+#     - id: "2"
+#       name: "Charlie Davis"
+#       email: "charlie@example.com"
+#       active: "false"
+#     - id: "3"
+#       name: "Diana Evans"
+#       email: "diana@example.com"
+#       active: "true"
+#   expected_state: {}
+#   expected_next_state: {}
+
+- id: 10
+  name: test_processor_outputs_env_and_store
+  mock_response:
+    data:
+      - id: 1
+        name: Item 1
+        value: 100
+      - id: 2
+        name: Item 2
+        value: 200
+      - id: 3
+        name: Item 3
+        value: 150
+  spec:
+    name: test_api
+    authentication:
+      type: none
+    endpoints:
+      test_endpoint:
+        name: test_endpoint
+        response:
+          processors:
+            # Test context.store output - store first name
+            - expression: record.name
+              aggregation: first
+              output: context.store.first_name
+
+            # Test env output - store last name as environment variable
+            - expression: record.name
+              aggregation: last
+              output: env.TEST_LAST_NAME
+          records:
+            jmespath: data
+  expected_records:
+    - id: "1"
+      name: Item 1
+      value: "100"
+    - id: "2"
+      name: Item 2
+      value: "200"
+    - id: "3"
+      name: Item 3
+      value: "150"
+  expected_state: {}
+  expected_store:
+    first_name: Item 1
+  expected_env:
+    TEST_LAST_NAME: Item 3
+
+- id: 11
+  name: explode_record_expansion
+  mock_response:
+    data:
+      - id: 1
+        name: Order 1
+        items:
+          - sku: A100
+            qty: 2
+          - sku: B200
+            qty: 5
+      - id: 2
+        name: Order 2
+        items:
+          - sku: C300
+            qty: 1
+  spec:
+    name: test_api
+    authentication:
+      type: none
+    endpoints:
+      test_endpoint:
+        name: test_endpoint
+        response:
+          processors:
+            - expression: 'explode(record, "items")'
+              output: record
+          records:
+            jmespath: data
+  expected_records:
+    - id: "1"
+      name: Order 1
+      sku: A100
+      qty: "2"
+    - id: "1"
+      name: Order 1
+      sku: B200
+      qty: "5"
+    - id: "2"
+      name: Order 2
+      sku: C300
+      qty: "1"
+  expected_state: {}
+
+- id: 12
+  name: explode_with_subsequent_processor
+  mock_response:
+    data:
+      - id: 1
+        details:
+          - key: color
+            value: red
+          - key: size
+            value: large
+  spec:
+    name: test_api
+    authentication:
+      type: none
+    endpoints:
+      test_endpoint:
+        name: test_endpoint
+        response:
+          processors:
+            - expression: 'explode(record, "details")'
+              output: record
+            - expression: 'upper(record.value)'
+              output: record.value
+          records:
+            jmespath: data
+  expected_records:
+    - id: "1"
+      key: color
+      value: RED
+    - id: "1"
+      key: size
+      value: LARGE
+  expected_state: {}
+
+- id: 13
+  name: extract_records_with_jq
+  mock_response:
+    data:
+      - id: 1
+        name: Item 1
+      - id: 2
+        name: Item 2
+  spec:
+    name: test_api
+    authentication:
+      type: none
+    endpoints:
+      test_endpoint:
+        name: test_endpoint
+        response:
+          records:
+            jq: ".data[]"
+  expected_records:
+    - id: "1"
+      name: Item 1
+    - id: "2"
+      name: Item 2
+  expected_state: {}
+  expected_next_state: {}
+
+- id: 14
+  name: jmespath_with_state_variable_rendering
+  mock_response:
+    customers:
+      - id: 1
+        name: Alice
+        email: alice@example.com
+      - id: 2
+        name: Bob
+        email: bob@example.com
+  spec:
+    name: test_api
+    authentication:
+      type: none
+    endpoints:
+      test_endpoint:
+        name: test_endpoint
+        state:
+          endpoint_name: customers
+        response:
+          records:
+            jmespath: "{state.endpoint_name}[]"
+  expected_records:
+    - id: "1"
+      name: Alice
+      email: alice@example.com
+    - id: "2"
+      name: Bob
+      email: bob@example.com
+  expected_state:
+    endpoint_name: customers
+
+- id: 15
+  name: jq_with_state_variable_rendering
+  mock_response:
+    orders:
+      - id: 101
+        product: Widget
+        quantity: 5
+      - id: 102
+        product: Gadget
+        quantity: 3
+  spec:
+    name: test_api
+    authentication:
+      type: none
+    endpoints:
+      test_endpoint:
+        name: test_endpoint
+        state:
+          resource: orders
+        response:
+          records:
+            jq: ".{state.resource}[]"
+  expected_records:
+    - id: "101"
+      product: Widget
+      quantity: "5"
+    - id: "102"
+      product: Gadget
+      quantity: "3"
+  expected_state:
+    resource: orders
+
+# id: 16 - Reproduces an API returning boolean `false` for unset fields.
+# Without a processor, `false` leaks through as the string "false",
+# breaking date/numeric casting downstream.
+- id: 16
+  name: boolean_false_leaks_through_without_processor
+  mock_response:
+    result:
+      - id: 1
+        name: Item One
+        date: "2026-05-08"
+        amount: 145.2
+      - id: 2
+        name: false
+        date: false
+        amount: false
+  spec:
+    name: test_api
+    authentication:
+      type: none
+    endpoints:
+      test_endpoint:
+        name: test_endpoint
+        response:
+          records:
+            jmespath: "result[*]"
+            primary_key: ['id']
+  expected_records:
+    - id: "1"
+      name: Item One
+      date: "2026-05-08"
+      amount: "145.2"
+    - id: "2"
+      name: "false"
+      date: "false"
+      amount: "false"
+  expected_state: {}
+
+# id: 17 - Spec-level fix: record-level processors use null_if() to coerce a
+# boolean `false` sentinel to null per field. Works for any column type (date,
+# string, numeric) since null_if compares the raw value to the given sentinel.
+- id: 17
+  name: boolean_false_to_null_via_record_processor
+  mock_response:
+    result:
+      - id: 1
+        name: Item One
+        date: "2026-05-08"
+        amount: 145.2
+      - id: 2
+        name: false
+        date: false
+        amount: false
+  spec:
+    name: test_api
+    authentication:
+      type: none
+    endpoints:
+      test_endpoint:
+        name: test_endpoint
+        response:
+          processors:
+            - expression: 'null_if(record.name, false)'
+              output: record.name
+            - expression: 'null_if(record.date, false)'
+              output: record.date
+            - expression: 'null_if(record.amount, false)'
+              output: record.amount
+          records:
+            jmespath: "result[*]"
+            primary_key: ['id']
+  expected_records:
+    - id: "1"
+      name: Item One
+      date: "2026-05-08"
+      amount: "145.2"
+    - id: "2"
+      name: null
+      date: null
+      amount: null
+  expected_state: {}
+
+# id: 18 - chunk() + iterate: all chunk responses must be merged into the output.
+# Reproduces the report: a list chunked into N batches hits the API N times, but
+# only the first chunk's records reached the target. The mock here is body-aware
+# (see api_test.go) and echoes one record per id in the request's `ids` payload,
+# so a correct run produces every id across all chunks. A regression where only
+# the first chunk loads would yield just the first 3 records and fail.
+- id: 18
+  name: chunk_iterate_merges_all_responses
+  mock_response: {}
+  spec:
+    name: test_api
+    authentication:
+      type: none
+    endpoints:
+      test_endpoint:
+        name: test_endpoint
+        state:
+          # 9 ids -> chunks of 3 -> 3 chunks -> 3 requests
+          item_ids: [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        iterate:
+          over: 'chunk(state.item_ids, 3)'
+          into: 'state.batch_ids'
+          concurrency: 1
+        request:
+          method: POST
+          payload:
+            ids: '{state.batch_ids}'
+        response:
+          records:
+            jmespath: data
+  # all 9 ids must arrive, across the 3 chunk requests
+  expected_records:
+    - id: "1"
+      name: item_1
+    - id: "2"
+      name: item_2
+    - id: "3"
+      name: item_3
+    - id: "4"
+      name: item_4
+    - id: "5"
+      name: item_5
+    - id: "6"
+      name: item_6
+    - id: "7"
+      name: item_7
+    - id: "8"
+      name: item_8
+    - id: "9"
+      name: item_9
+  expected_state: {}
+
+# id: 19 - Dynamic boolean-false-to-null via a single jq() processor.
+- id: 19
+  name: boolean_false_to_null_via_jq_processor
+  mock_response:
+    result:
+      - id: 1
+        name: Item One
+        date: "2026-05-08"
+        amount: 145.2
+        active: true
+      - id: 2
+        name: false
+        date: false
+        amount: false
+        active: false
+  spec:
+    name: test_api
+    authentication:
+      type: none
+    endpoints:
+      test_endpoint:
+        name: test_endpoint
+        response:
+          processors:
+            # map_values walks every key/value; real boolean `false` -> null,
+            # any other value (incl. the string "false") is left untouched.
+            - expression: 'jq(record, "map_values(if . == false then null else . end)")'
+              output: record
+          records:
+            jmespath: "result[*]"
+            primary_key: ['id']
+  expected_records:
+    - id: "1"
+      name: Item One
+      date: "2026-05-08"
+      amount: "145.2"
+      active: "true"
+    - id: "2"
+      name: null
+      date: null
+      amount: null
+      active: null
+  expected_state: {}
+
+# id: 20 - records.select with an explicit list narrows the output columns.
+# Only the listed columns survive, in the order listed. Uses mock_response_raw
+# so the response body keeps the author-written key order (a map-based mock
+# would be alphabetized by the JSON encoder).
+- id: 20
+  name: select_explicit_list_narrows_columns
+  mock_response_raw: |
+    [
+      {"id":1,"name":"Alice","email":"alice@example.com","age":30,"internal_score":99},
+      {"id":2,"name":"Bob","email":"bob@example.com","age":25,"internal_score":42}
+    ]
+  spec:
+    name: test_api
+    authentication:
+      type: none
+    endpoints:
+      test_endpoint:
+        name: test_endpoint
+        response:
+          records:
+            jmespath: "@"
+            select:
+              - id
+              - name
+  expected_columns: [id, name]
+  expected_records:
+    - id: "1"
+      name: Alice
+    - id: "2"
+      name: Bob
+  expected_state: {}
+
+# id: 21 - records.select with exclusion globs drops matching columns while
+# keeping everything else via implicit `*`. The remaining columns emit
+# ALPHABETICALLY (the API source field order is not preserved) — so
+# {id,name,email} minus internal_* comes out [email, id, name].
+- id: 21
+  name: select_exclude_glob_drops_matching_columns
+  mock_response_raw: |
+    [
+      {"id":1,"name":"Alice","email":"alice@example.com","internal_score":99,"internal_flag":true},
+      {"id":2,"name":"Bob","email":"bob@example.com","internal_score":42,"internal_flag":false}
+    ]
+  spec:
+    name: test_api
+    authentication:
+      type: none
+    endpoints:
+      test_endpoint:
+        name: test_endpoint
+        response:
+          records:
+            jmespath: "@"
+            select:
+              - "-internal_*"
+  expected_columns: [email, id, name]
+  expected_records:
+    - id: "1"
+      name: Alice
+      email: alice@example.com
+    - id: "2"
+      name: Bob
+      email: bob@example.com
+  expected_state: {}
+
+# id: 22 - records.select rename: `id as uid` renames the column; other
+# listed columns keep their names. Output order follows the select list.
+- id: 22
+  name: select_rename_with_explicit_list
+  mock_response_raw: |
+    [
+      {"id":1,"name":"Alice","email":"alice@example.com"},
+      {"id":2,"name":"Bob","email":"bob@example.com"}
+    ]
+  spec:
+    name: test_api
+    authentication:
+      type: none
+    endpoints:
+      test_endpoint:
+        name: test_endpoint
+        response:
+          records:
+            jmespath: "@"
+            select:
+              - id as uid
+              - name
+              - email
+  expected_columns: [uid, name, email]
+  expected_records:
+    - uid: "1"
+      name: Alice
+      email: alice@example.com
+    - uid: "2"
+      name: Bob
+      email: bob@example.com
+  expected_state: {}
+
+# id: 23 - records.select reorder: front-pins `id` and `name`, the `*`
+# remainder fills the middle ALPHABETICALLY (the API source field order is not
+# preserved), and `created_at`/`updated_at` pin to the back. Explicit pins hold
+# their list position; only the `*` remainder is alphabetized.
+- id: 23
+  name: select_reorder_front_star_back_pins
+  mock_response_raw: |
+    [
+      {"extra_b":"B1","created_at":"2025-01-10","extra_a":"A1","name":"Alice","id":1,"updated_at":"2025-01-11","email":"alice@example.com"},
+      {"extra_b":"B2","created_at":"2025-01-12","extra_a":"A2","name":"Bob","id":2,"updated_at":"2025-01-13","email":"bob@example.com"}
+    ]
+  spec:
+    name: test_api
+    authentication:
+      type: none
+    endpoints:
+      test_endpoint:
+        name: test_endpoint
+        response:
+          records:
+            jmespath: "@"
+            select:
+              - id
+              - name
+              - "*"
+              - created_at
+              - updated_at
+  # With select [id, name, *, created_at, updated_at]: `id` and `name` pin to
+  # the front; the `*` remainder (the columns not otherwise named: extra_a,
+  # extra_b, email) fills the middle ALPHABETICALLY → email, extra_a, extra_b;
+  # `created_at` and `updated_at` pin to the back.
+  expected_columns: [id, name, email, extra_a, extra_b, created_at, updated_at]
+  expected_records:
+    - id: "1"
+      name: Alice
+      email: alice@example.com
+      extra_a: A1
+      extra_b: B1
+      created_at: "2025-01-10"
+      updated_at: "2025-01-11"
+    - id: "2"
+      name: Bob
+      email: bob@example.com
+      extra_a: A2
+      extra_b: B2
+      created_at: "2025-01-12"
+      updated_at: "2025-01-13"
+  expected_state: {}
+
+# Reproduces: state templates that call a function with a quoted format
+# argument (e.g. date_format(..., "%Y-%m-%d")) are NOT rendered before the
+# endpoint `setup` sequence runs. A setup request payload referencing such a
+# state var ships the raw template string to the server instead of the resolved
+# value. The main request path renders state via renderInitial(); the setup
+# path does not. This test asserts the value the setup request actually sent.
+- id: 24
+  name: test_setup_state_render_date_format
+  mock_response:
+    users:
+      - id: 1
+        name: "John Doe"
+  spec:
+    name: setup_state_render_api
+    description: "Test that state function templates render before setup runs"
+    authentication:
+      type: none
+    endpoints:
+      test_endpoint:
+        description: "Main endpoint whose setup references a date_format() state var"
+        state:
+          # deterministic (no now()) so the expected value is stable, but
+          # exercises the exact failing pattern: function + quoted "%"-format arg
+          date_filter: '{date_format(date_parse("2026-05-01"), "%Y-%m-%d")}'
+        setup:
+          - request:
+              url: "/echo"
+              method: POST
+              payload:
+                filter: "{state.date_filter}"
+            response:
+              processors:
+                - expression: "response.json.received.filter"
+                  output: "state.echoed_filter"
+                  aggregation: last
+        request:
+          url: "/users"
+          method: GET
+        response:
+          records:
+            jmespath: users
+  expected_records:
+    - id: "1"
+      name: "John Doe"
+  # With the bug, echoed_filter is the raw '{date_format(date_parse("2026-05-01"), "%Y-%m-%d")}'.
+  # After the fix, the setup request sends (and echoes back) the resolved date.
+  expected_state:
+    date_filter: "2026-05-01"
+    echoed_filter: "2026-05-01"
+  expected_next_state: {}
+
+# id: 25 - `sync` variables must be available during the endpoint `setup`
+# sequence, not only during the main request. On an incremental re-run the prior
+# watermark is restored into endpoint.syncMap (seeded here via `sync_state`); a
+# setup request referencing {sync.last_updated} must send the resolved value.
+# The /echo handler reflects the payload so we assert what setup actually sent.
+- id: 25
+  name: test_setup_sequence_sync_var_unavailable
+  mock_response:
+    items:
+      - id: 1
+        name: "Item One"
+  sync_state:
+    last_updated: "2026-05-01T00:00:00Z"
+  spec:
+    name: setup_sync_api
+    description: "Test that sync variables are available during the setup sequence"
+    authentication:
+      type: none
+    endpoints:
+      test_endpoint:
+        sync: [last_updated]
+        setup:
+          - request:
+              url: "/echo"
+              method: POST
+              payload:
+                watermark: "{sync.last_updated}"
+            response:
+              processors:
+                - expression: "response.json.received.watermark"
+                  output: "state.echoed_watermark"
+                  aggregation: last
+        request:
+          url: "/items"
+          method: GET
+          headers:
+            X-Watermark: "{sync.last_updated}"
+        response:
+          processors:
+            - expression: record.name
+              output: state.last_updated
+              aggregation: maximum
+          records:
+            jmespath: items
+  expected_records:
+    - id: "1"
+      name: "Item One"
+  expected_state:
+    echoed_watermark: "2026-05-01T00:00:00Z"
+  expected_next_state: {}
+
